@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -66,6 +67,116 @@ func TestRateLimiter_AllowN(t *testing.T) {
 	assert.Equal(t, true, limiter.AllowN(now.Add(time.Second), "tenant-2", 2))
 }
 
+func TestRateLimiter_TokensAt(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1":  {limit: 10, burst: 20},
+		"unlimited": {limit: float64(rate.Inf), burst: 0},
+	}}
+
+	limiter := NewRateLimiter(strategy, 10*time.Second)
+	now := time.Now()
+
+	// A brand new tenant limiter starts fully bursted.
+	assert.Equal(t, float64(20), limiter.TokensAt(now, "tenant-1"))
+
+	// TokensAt does not consume tokens: calling it repeatedly returns the
+	// same value and does not affect subsequent AllowN calls.
+	assert.Equal(t, float64(20), limiter.TokensAt(now, "tenant-1"))
+	assert.True(t, limiter.AllowN(now, "tenant-1", 20))
+
+	// All tokens have been consumed.
+	assert.Equal(t, float64(0), limiter.TokensAt(now, "tenant-1"))
+	assert.False(t, limiter.AllowN(now, "tenant-1", 1))
+
+	// Tokens are replenished over time (limit is 10/s).
+	assert.Equal(t, float64(5), limiter.TokensAt(now.Add(500*time.Millisecond), "tenant-1"))
+
+	// ReserveN can push the token count negative; TokensAt reflects that.
+	r := limiter.ReserveN(now, "tenant-1", 15)
+	assert.True(t, r.OK())
+	assert.Equal(t, float64(-15), limiter.TokensAt(now, "tenant-1"))
+
+	// An unlimited limiter can allow requests even with a zero burst.
+	assert.True(t, limiter.AllowN(now, "unlimited", 1))
+	assert.True(t, math.IsInf(limiter.TokensAt(now, "unlimited"), 1))
+}
+
+func TestRateLimiter_ReserveN(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1": {limit: 10, burst: 20},
+	}}
+
+	limiter := NewRateLimiter(strategy, 10*time.Second)
+	now := time.Now()
+
+	// A reservation within the burst is OK and requires no wait.
+	r := limiter.ReserveN(now, "tenant-1", 5)
+	assert.True(t, r.OK())
+	assert.Equal(t, time.Duration(0), r.DelayFrom(now))
+
+	// Exhaust the remaining burst.
+	r = limiter.ReserveN(now, "tenant-1", 15)
+	assert.True(t, r.OK())
+	assert.Equal(t, time.Duration(0), r.DelayFrom(now))
+
+	// Once the burst is exhausted, a further reservation is OK but must wait.
+	r = limiter.ReserveN(now, "tenant-1", 5)
+	assert.True(t, r.OK())
+	assert.Greater(t, r.DelayFrom(now), time.Duration(0))
+}
+
+func TestRateLimiter_ReserveN_Cancel(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1": {limit: 10, burst: 20},
+	}}
+
+	limiter := NewRateLimiter(strategy, 10*time.Second)
+	now := time.Now()
+
+	// Reserve the whole burst.
+	r := limiter.ReserveN(now, "tenant-1", 20)
+	assert.True(t, r.OK())
+	assert.Equal(t, time.Duration(0), r.DelayFrom(now))
+
+	// With the bucket exhausted, a full-burst request can't be served immediately.
+	assert.False(t, limiter.AllowN(now, "tenant-1", 20))
+
+	// Cancelling the reservation should return the tokens to the bucket. We use
+	// CancelAt(now) rather than Cancel() to keep the test deterministic: Cancel()
+	// uses time.Now() internally, which would have advanced past the fixed now and
+	// turned the cancellation into a no-op.
+	r.CancelAt(now)
+
+	// Now the same amount can be consumed again at the same instant, proving
+	// that cancellation restored the tokens.
+	assert.True(t, limiter.AllowN(now, "tenant-1", 20))
+}
+
+func TestRateLimiter_ReserveN_ExceedsBurst(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1": {limit: 10, burst: 20},
+	}}
+
+	limiter := NewRateLimiter(strategy, 10*time.Second)
+	now := time.Now()
+
+	// A reservation larger than the burst can never be satisfied.
+	r := limiter.ReserveN(now, "tenant-1", 21)
+	assert.False(t, r.OK())
+}
+
 func TestRateLimiter_WaitN(t *testing.T) {
 	strategy := &staticLimitStrategy{tenants: map[string]struct {
 		limit float64
@@ -106,6 +217,39 @@ func TestRateLimiter_WaitN(t *testing.T) {
 		cancel()
 	}()
 	assert.NotNil(t, limiter.WaitN(ctxToCancel, "tenant", 1))
+}
+
+func TestRateLimiter_RemoveStaleEntries(t *testing.T) {
+	strategy := &staticLimitStrategy{tenants: map[string]struct {
+		limit float64
+		burst int
+	}{
+		"tenant-1": {limit: 10, burst: 20},
+		"tenant-2": {limit: 10, burst: 20},
+		"tenant-3": {limit: 10, burst: 20},
+	}}
+
+	recheckPeriod := 10 * time.Second
+	limiter := NewRateLimiter(strategy, recheckPeriod)
+	now := time.Now()
+
+	assert.Equal(t, 0, limiter.RemoveStaleEntries(now.Add(time.Hour)))
+
+	limiter.AllowN(now, "tenant-1", 1)
+	limiter.AllowN(now.Add(5*time.Second), "tenant-2", 1)
+	limiter.AllowN(now.Add(9*time.Second), "tenant-3", 1)
+
+	assert.Equal(t, 0, limiter.RemoveStaleEntries(now))
+	assert.Equal(t, 1, limiter.RemoveStaleEntries(now.Add(12*time.Second)))
+
+	assert.Equal(t, true, limiter.AllowN(now.Add(12*time.Second), "tenant-2", 1))
+	assert.Equal(t, true, limiter.AllowN(now.Add(12*time.Second), "tenant-3", 1))
+
+	limiter.AllowN(now.Add(12*time.Second), "tenant-1", 1)
+
+	assert.Equal(t, 2, limiter.RemoveStaleEntries(now.Add(20*time.Second)))
+	assert.Equal(t, 1, limiter.RemoveStaleEntries(now.Add(time.Hour)))
+	assert.Equal(t, 0, limiter.RemoveStaleEntries(now.Add(2*time.Hour)))
 }
 
 func BenchmarkRateLimiter_CustomMultiTenant(b *testing.B) {

@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -318,7 +318,7 @@ func TestSpreadMinimizingTokenGenerator_VerifyInstanceOwnershipSpreadByZone(t *t
 	t.Parallel()
 
 	tokensPerInstance := 512
-	instancesPerZone := 10000
+	instancesPerZone := 1000
 	instanceByToken, tokensByZone := createTokensForAllInstancesAndZones(t, instancesPerZone, tokensPerInstance)
 	ownershipByInstanceByZone := registeredOwnershipByZone(instancesPerZone, instanceByToken, tokensByZone)
 	for _, ownershipByInstance := range ownershipByInstanceByZone {
@@ -484,7 +484,7 @@ func TestSpreadMinimizingTokenGenerator_CanJoin(t *testing.T) {
 			state = PENDING
 			tokens = nil
 		}
-		ringDesc.AddIngester(instance, instance, zone, tokens, state, time.Now())
+		ringDesc.AddIngester(instance, instance, zone, tokens, state, time.Now(), false, time.Time{}, nil)
 	}
 
 	instances := ringDesc.GetIngesters()

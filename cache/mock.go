@@ -14,15 +14,18 @@ import (
 var (
 	_ Cache = (*MockCache)(nil)
 	_ Cache = (*InstrumentedMockCache)(nil)
+	_ Cache = (*ErroringMockCache)(nil)
+	_ Cache = (*SlowMockCache)(nil)
 )
 
 type MockCache struct {
 	mu    sync.Mutex
 	cache map[string]Item
+	now   time.Time
 }
 
 func NewMockCache() *MockCache {
-	c := &MockCache{}
+	c := &MockCache{now: time.Now()}
 	c.Flush()
 	return c
 }
@@ -30,26 +33,50 @@ func NewMockCache() *MockCache {
 func (m *MockCache) SetAsync(key string, value []byte, ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cache[key] = Item{Data: value, ExpiresAt: time.Now().Add(ttl)}
+	m.cache[key] = Item{Data: value, ExpiresAt: m.now.Add(ttl)}
 }
 
 func (m *MockCache) SetMultiAsync(data map[string][]byte, ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	exp := time.Now().Add(ttl)
+	exp := m.now.Add(ttl)
 	for key, val := range data {
 		m.cache[key] = Item{Data: val, ExpiresAt: exp}
 	}
 }
 
-func (m *MockCache) GetMulti(_ context.Context, keys []string, _ ...Option) map[string][]byte {
+func (m *MockCache) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cache[key] = Item{Data: value, ExpiresAt: m.now.Add(ttl)}
+	return nil
+}
+
+func (m *MockCache) Add(_ context.Context, key string, value []byte, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if i, ok := m.cache[key]; ok && i.ExpiresAt.After(m.now) {
+		return ErrNotStored
+	}
+
+	m.cache[key] = Item{Data: value, ExpiresAt: m.now.Add(ttl)}
+	return nil
+}
+
+func (m *MockCache) GetMulti(ctx context.Context, keys []string, opts ...Option) map[string][]byte {
+	result, _ := m.GetMultiWithError(ctx, keys, opts...)
+	return result
+}
+
+func (m *MockCache) GetMultiWithError(_ context.Context, keys []string, _ ...Option) (map[string][]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	found := make(map[string][]byte, len(keys))
 
-	now := time.Now()
+	now := m.now
 	for _, k := range keys {
 		v, ok := m.cache[k]
 		if ok && now.Before(v.ExpiresAt) {
@@ -57,7 +84,7 @@ func (m *MockCache) GetMulti(_ context.Context, keys []string, _ ...Option) map[
 		}
 	}
 
-	return found
+	return found, nil
 }
 
 func (m *MockCache) GetItems() map[string]Item {
@@ -88,11 +115,20 @@ func (m *MockCache) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+// Flush removes all entries from the cache
 func (m *MockCache) Flush() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.cache = map[string]Item{}
+}
+
+// Advance changes "now" by the given duration
+func (m *MockCache) Advance(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.now = m.now.Add(d)
 }
 
 // InstrumentedMockCache is a mocked cache implementation which also tracks the number
@@ -121,9 +157,24 @@ func (m *InstrumentedMockCache) SetMultiAsync(data map[string][]byte, ttl time.D
 	m.cache.SetMultiAsync(data, ttl)
 }
 
+func (m *InstrumentedMockCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	m.storeCount.Inc()
+	return m.cache.Set(ctx, key, value, ttl)
+}
+
+func (m *InstrumentedMockCache) Add(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	m.storeCount.Inc()
+	return m.cache.Add(ctx, key, value, ttl)
+}
+
 func (m *InstrumentedMockCache) GetMulti(ctx context.Context, keys []string, opts ...Option) map[string][]byte {
 	m.fetchCount.Inc()
 	return m.cache.GetMulti(ctx, keys, opts...)
+}
+
+func (m *InstrumentedMockCache) GetMultiWithError(ctx context.Context, keys []string, opts ...Option) (map[string][]byte, error) {
+	m.fetchCount.Inc()
+	return m.cache.GetMultiWithError(ctx, keys, opts...)
 }
 
 func (m *InstrumentedMockCache) Name() string {
@@ -143,8 +194,14 @@ func (m *InstrumentedMockCache) GetItems() map[string]Item {
 	return m.cache.GetItems()
 }
 
+// Flush removes all entries from the cache
 func (m *InstrumentedMockCache) Flush() {
 	m.cache.Flush()
+}
+
+// Advance changes "now" by the given duration
+func (m *InstrumentedMockCache) Advance(d time.Duration) {
+	m.cache.Advance(d)
 }
 
 func (m *InstrumentedMockCache) CountStoreCalls() int {
@@ -157,4 +214,53 @@ func (m *InstrumentedMockCache) CountFetchCalls() int {
 
 func (m *InstrumentedMockCache) CountDeleteCalls() int {
 	return int(m.deleteCount.Load())
+}
+
+// ErroringMockCache is a mock cache that can be configured to return errors
+// from GetMultiWithError. Useful for testing error propagation through cache wrappers.
+type ErroringMockCache struct {
+	*MockCache
+	GetMultiErr error
+}
+
+// NewErroringMockCache creates a new ErroringMockCache with the given error.
+func NewErroringMockCache(err error) *ErroringMockCache {
+	return &ErroringMockCache{
+		MockCache:   NewMockCache(),
+		GetMultiErr: err,
+	}
+}
+
+func (m *ErroringMockCache) GetMulti(ctx context.Context, keys []string, opts ...Option) map[string][]byte {
+	result, _ := m.GetMultiWithError(ctx, keys, opts...)
+	return result
+}
+
+func (m *ErroringMockCache) GetMultiWithError(ctx context.Context, keys []string, opts ...Option) (map[string][]byte, error) {
+	result, _ := m.MockCache.GetMultiWithError(ctx, keys, opts...)
+	return result, m.GetMultiErr
+}
+
+// SlowMockCache wraps MockCache and sleeps for a fixed latency on every read.
+// The latency models the network round trip to a remote cache backend.
+type SlowMockCache struct {
+	*MockCache
+	getLatency time.Duration
+}
+
+func NewSlowMockCache(getLatency time.Duration) *SlowMockCache {
+	return &SlowMockCache{
+		MockCache:  NewMockCache(),
+		getLatency: getLatency,
+	}
+}
+
+func (m *SlowMockCache) GetMulti(ctx context.Context, keys []string, opts ...Option) map[string][]byte {
+	result, _ := m.GetMultiWithError(ctx, keys, opts...)
+	return result
+}
+
+func (m *SlowMockCache) GetMultiWithError(ctx context.Context, keys []string, opts ...Option) (map[string][]byte, error) {
+	time.Sleep(m.getLatency)
+	return m.MockCache.GetMultiWithError(ctx, keys, opts...)
 }

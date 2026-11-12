@@ -2,6 +2,8 @@ package grpcclient
 
 import (
 	"flag"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -11,10 +13,18 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/dskit/clusterutil"
 	"github.com/grafana/dskit/crypto/tls"
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/grpcencoding/snappy"
+	"github.com/grafana/dskit/middleware"
 )
+
+// grpcWithChainUnaryInterceptor helps to ensure that the requested order of interceptors is preserved.
+var grpcWithChainUnaryInterceptor = grpc.WithChainUnaryInterceptor
+
+// clusterUnaryClientInterceptor lets tests identify the interceptor DialOption appends.
+var clusterUnaryClientInterceptor = middleware.ClusterUnaryClientInterceptor
 
 // Config for a gRPC client.
 type Config struct {
@@ -38,8 +48,16 @@ type Config struct {
 	ConnectBackoffBaseDelay time.Duration `yaml:"connect_backoff_base_delay" category:"advanced"`
 	ConnectBackoffMaxDelay  time.Duration `yaml:"connect_backoff_max_delay" category:"advanced"`
 
+	KeepaliveTime    time.Duration `yaml:"keepalive_time" category:"advanced"`
+	KeepaliveTimeout time.Duration `yaml:"keepalive_timeout" category:"advanced"`
+
 	Middleware       []grpc.UnaryClientInterceptor  `yaml:"-"`
 	StreamMiddleware []grpc.StreamClientInterceptor `yaml:"-"`
+
+	// CustomCompressors allows configuring custom compressors.
+	CustomCompressors []string `yaml:"-"`
+
+	ClusterValidation clusterutil.ClusterValidationConfig `yaml:"cluster_validation" category:"experimental"`
 }
 
 // RegisterFlags registers flags.
@@ -49,15 +67,30 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 
 const defaultInitialWindowSize = 65535 // From https://github.com/grpc/grpc-go/blob/c9d3ea5673252d212c69f3d3c10ce1d7b287a86b/internal/transport/defaults.go#L28
 
+const (
+	defaultKeepaliveTime    = 20 * time.Second
+	defaultKeepaliveTimeout = 10 * time.Second
+)
+
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	// Set the default values.
 	cfg.InitialStreamWindowSize = defaultInitialWindowSize
 	cfg.InitialConnectionWindowSize = defaultInitialWindowSize
 
+	var supportedCompressors strings.Builder
+	supportedCompressors.WriteString("Use compression when sending messages. Supported values are: 'gzip', 'snappy'")
+	for _, cmp := range cfg.CustomCompressors {
+		supportedCompressors.WriteString(", ")
+		supportedCompressors.WriteString("'")
+		supportedCompressors.WriteString(cmp)
+		supportedCompressors.WriteString("'")
+	}
+	supportedCompressors.WriteString(" and '' (disable compression)")
+
 	f.IntVar(&cfg.MaxRecvMsgSize, prefix+".grpc-max-recv-msg-size", 100<<20, "gRPC client max receive message size (bytes).")
 	f.IntVar(&cfg.MaxSendMsgSize, prefix+".grpc-max-send-msg-size", 100<<20, "gRPC client max send message size (bytes).")
-	f.StringVar(&cfg.GRPCCompression, prefix+".grpc-compression", "", "Use compression when sending messages. Supported values are: 'gzip', 'snappy' and '' (disable compression)")
+	f.StringVar(&cfg.GRPCCompression, prefix+".grpc-compression", "", supportedCompressors.String())
 	f.Float64Var(&cfg.RateLimit, prefix+".grpc-client-rate-limit", 0., "Rate limit for gRPC client; 0 means disabled.")
 	f.IntVar(&cfg.RateLimitBurst, prefix+".grpc-client-rate-limit-burst", 0, "Rate limit burst for gRPC client.")
 	f.BoolVar(&cfg.BackoffOnRatelimits, prefix+".backoff-on-ratelimits", false, "Enable backoff and retry when we hit rate limits.")
@@ -67,18 +100,19 @@ func (cfg *Config) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.DurationVar(&cfg.ConnectTimeout, prefix+".connect-timeout", 5*time.Second, "The maximum amount of time to establish a connection. A value of 0 means default gRPC client connect timeout and backoff.")
 	f.DurationVar(&cfg.ConnectBackoffBaseDelay, prefix+".connect-backoff-base-delay", time.Second, "Initial backoff delay after first connection failure. Only relevant if ConnectTimeout > 0.")
 	f.DurationVar(&cfg.ConnectBackoffMaxDelay, prefix+".connect-backoff-max-delay", 5*time.Second, "Maximum backoff delay when establishing a connection. Only relevant if ConnectTimeout > 0.")
+	f.DurationVar(&cfg.KeepaliveTime, prefix+".keepalive-time", defaultKeepaliveTime, "After a duration of this time if the client doesn't see any activity it pings the server to see if the transport is still alive. This also determines the socket's TCP_USER_TIMEOUT together with keepalive-timeout.")
+	f.DurationVar(&cfg.KeepaliveTimeout, prefix+".keepalive-timeout", defaultKeepaliveTimeout, "After having pinged for keepalive check, the client waits for a duration of this time and if no activity is seen even after that the connection is closed.")
 
 	cfg.BackoffConfig.RegisterFlagsWithPrefix(prefix, f)
-
 	cfg.TLS.RegisterFlagsWithPrefix(prefix, f)
+	cfg.ClusterValidation.RegisterFlagsWithPrefix(prefix+".cluster-validation.", f)
 }
 
 func (cfg *Config) Validate() error {
-	switch cfg.GRPCCompression {
-	case gzip.Name, snappy.Name, "":
-		// valid
-	default:
-		return errors.Errorf("unsupported compression type: %s", cfg.GRPCCompression)
+	supportedCompressors := []string{gzip.Name, snappy.Name, ""}
+	supportedCompressors = append(supportedCompressors, cfg.CustomCompressors...)
+	if !slices.Contains(supportedCompressors, cfg.GRPCCompression) {
+		return errors.Errorf("unsupported compression type: %q", cfg.GRPCCompression)
 	}
 	return nil
 }
@@ -94,9 +128,14 @@ func (cfg *Config) CallOptions() []grpc.CallOption {
 	return opts
 }
 
-// DialOption returns the config as a grpc.DialOptions. The passed inceptors
-// wrap around the configured middleware.
-func (cfg *Config) DialOption(unaryClientInterceptors []grpc.UnaryClientInterceptor, streamClientInterceptors []grpc.StreamClientInterceptor) ([]grpc.DialOption, error) {
+// DialOption returns the config as a grpc.DialOptions. The passed interceptors wrap around the configured middleware.
+// It requires an InvalidClusterValidationReporter for reporting the cluster validation issues back to the caller,
+// if cluster validation is enabled.
+// If a nil InvalidClusterValidationReporter is provided, a NoOpInvalidClusterValidationReporter is used.
+func (cfg *Config) DialOption(unaryClientInterceptors []grpc.UnaryClientInterceptor, streamClientInterceptors []grpc.StreamClientInterceptor, invalidClusterValidationReporter middleware.InvalidClusterValidationReporter) ([]grpc.DialOption, error) {
+	if invalidClusterValidationReporter == nil {
+		invalidClusterValidationReporter = middleware.NoOpInvalidClusterValidationReporter
+	}
 	var opts []grpc.DialOption
 	tlsOpts, err := cfg.TLS.GetGRPCDialOptions(cfg.TLSEnabled)
 	if err != nil {
@@ -113,6 +152,14 @@ func (cfg *Config) DialOption(unaryClientInterceptors []grpc.UnaryClientIntercep
 
 	if cfg.RateLimit > 0 {
 		unaryClientInterceptors = append([]grpc.UnaryClientInterceptor{NewRateLimiter(cfg)}, unaryClientInterceptors...)
+	}
+
+	// If cluster validation is enabled, ClusterUnaryClientInterceptor must be the last UnaryClientInterceptor
+	// to wrap the real call.
+	if cfg.ClusterValidation.Label != "" {
+		// For client side, we use the primary label as our cluster identity
+		unaryClientInterceptors = append(unaryClientInterceptors,
+			clusterUnaryClientInterceptor(cfg.ClusterValidation.Label, invalidClusterValidationReporter))
 	}
 
 	if cfg.ConnectTimeout > 0 {
@@ -148,12 +195,28 @@ func (cfg *Config) DialOption(unaryClientInterceptors []grpc.UnaryClientIntercep
 	return append(
 		opts,
 		grpc.WithDefaultCallOptions(cfg.CallOptions()...),
-		grpc.WithChainUnaryInterceptor(unaryClientInterceptors...),
+		grpcWithChainUnaryInterceptor(unaryClientInterceptors...),
 		grpc.WithChainStreamInterceptor(streamClientInterceptors...),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                time.Second * 20,
-			Timeout:             time.Second * 10,
-			PermitWithoutStream: true,
-		}),
+		grpc.WithKeepaliveParams(cfg.keepaliveParams()),
 	), nil
+}
+
+// keepaliveParams returns the client keepalive parameters, falling back to the
+// defaults when Time or Timeout are unset (e.g. a Config built from YAML that
+// omits these keys, or a struct literal). This avoids accidentally disabling
+// keepalive: grpc-go treats a zero Time as "no keepalive pings".
+func (cfg *Config) keepaliveParams() keepalive.ClientParameters {
+	keepaliveTime := cfg.KeepaliveTime
+	if keepaliveTime <= 0 {
+		keepaliveTime = defaultKeepaliveTime
+	}
+	keepaliveTimeout := cfg.KeepaliveTimeout
+	if keepaliveTimeout <= 0 {
+		keepaliveTimeout = defaultKeepaliveTimeout
+	}
+	return keepalive.ClientParameters{
+		Time:                keepaliveTime,
+		Timeout:             keepaliveTimeout,
+		PermitWithoutStream: true,
+	}
 }

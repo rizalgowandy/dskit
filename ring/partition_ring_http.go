@@ -5,12 +5,12 @@ import (
 	_ "embed"
 	"fmt"
 	"html/template"
+	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
-
-	"golang.org/x/exp/slices"
 )
 
 //go:embed partition_ring_status.gohtml
@@ -19,6 +19,9 @@ var partitionRingPageTemplate = template.Must(template.New("webpage").Funcs(temp
 	"mod": func(i, j int32) bool {
 		return i%j == 0
 	},
+	"humanFloat": func(f float64) string {
+		return fmt.Sprintf("%.3g", f)
+	},
 	"formatTimestamp": func(ts time.Time) string {
 		return ts.Format("2006-01-02 15:04:05 MST")
 	},
@@ -26,6 +29,7 @@ var partitionRingPageTemplate = template.Must(template.New("webpage").Funcs(temp
 
 type PartitionRingUpdater interface {
 	ChangePartitionState(ctx context.Context, partitionID int32, toState PartitionState) error
+	SetPartitionStateChangeLock(ctx context.Context, partitionID int32, locked bool) error
 }
 
 type PartitionRingPageHandler struct {
@@ -56,19 +60,30 @@ func (h *PartitionRingPageHandler) handleGetRequest(w http.ResponseWriter, req *
 		ring     = h.reader.PartitionRing()
 		ringDesc = ring.desc
 	)
+	ownedTokens := ring.countTokens()
 
 	// Prepare the data to render partitions in the page.
 	partitionsByID := make(map[int32]partitionPageData, len(ringDesc.Partitions))
 	for id, partition := range ringDesc.Partitions {
+		tokens, err := ring.partitionTokens(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		owners := ring.PartitionOwnerIDsCopy(id)
 		slices.Sort(owners)
 
 		partitionsByID[id] = partitionPageData{
-			ID:             id,
-			Corrupted:      false,
-			State:          partition.State,
-			StateTimestamp: partition.GetStateTime(),
-			OwnerIDs:       owners,
+			ID:                id,
+			Corrupted:         false,
+			State:             partition.State,
+			StateTimestamp:    partition.GetStateTime(),
+			StateChangeLocked: partition.StateChangeLocked,
+			OwnerIDs:          owners,
+			TokenScheme:       partition.TokenScheme,
+			Tokens:            tokens,
+			NumTokens:         len(tokens),
+			Ownership:         distancePercentage(ownedTokens[id]),
 		}
 	}
 
@@ -84,6 +99,7 @@ func (h *PartitionRingPageHandler) handleGetRequest(w http.ResponseWriter, req *
 				State:          PartitionUnknown,
 				StateTimestamp: time.Time{},
 				OwnerIDs:       []string{ownerID},
+				Ownership:      distancePercentage(ownedTokens[owner.OwnedPartition]),
 			}
 
 			partitionsByID[owner.OwnedPartition] = partition
@@ -106,6 +122,8 @@ func (h *PartitionRingPageHandler) handleGetRequest(w http.ResponseWriter, req *
 		return partitions[i].ID < partitions[j].ID
 	})
 
+	tokensParam := req.URL.Query().Get("tokens")
+
 	renderHTTPResponse(w, partitionRingPageData{
 		Partitions: partitions,
 		PartitionStateChanges: map[PartitionState]PartitionState{
@@ -113,6 +131,7 @@ func (h *PartitionRingPageHandler) handleGetRequest(w http.ResponseWriter, req *
 			PartitionActive:   PartitionInactive,
 			PartitionInactive: PartitionActive,
 		},
+		ShowTokens: tokensParam == "true",
 	}, partitionRingPageTemplate, req)
 }
 
@@ -134,6 +153,50 @@ func (h *PartitionRingPageHandler) handlePostRequest(w http.ResponseWriter, req 
 			http.Error(w, fmt.Sprintf("failed to change partition state: %s", err.Error()), http.StatusBadRequest)
 			return
 		}
+	} else if req.FormValue("action") == "change_state_and_lock" {
+		// NOTE: To avoid playing Whac-a-Mole with rollout-operator (or other actors) reverting the state to active BEFORE the operator
+		// is able to lock the partition state change, we offer this method which attempts to change the state and lock immediately.
+		// This currently contains a race. But since usually this endpoint is served by many replicas, fixing the race would require
+		// some work. We believe it's not worth it to add the additional complexity and we rely on the user using this to ensure
+		// that the state change is locked in the desired state.
+		partitionID, err := strconv.Atoi(req.FormValue("partition_id"))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid partition ID: %s", err.Error()), http.StatusBadRequest)
+			return
+		}
+
+		toState, ok := PartitionState_value[req.FormValue("partition_state")]
+		if !ok {
+			http.Error(w, "invalid partition state", http.StatusBadRequest)
+			return
+		}
+
+		if err := h.updater.ChangePartitionState(req.Context(), int32(partitionID), PartitionState(toState)); err != nil {
+			http.Error(w, fmt.Sprintf("failed to change partition state: %s", err.Error()), http.StatusBadRequest)
+			return
+		}
+
+		if err := h.updater.SetPartitionStateChangeLock(req.Context(), int32(partitionID), true); err != nil {
+			http.Error(w, fmt.Sprintf("failed to lock partition state change: %s", err.Error()), http.StatusBadRequest)
+			return
+		}
+	} else if req.FormValue("action") == "state_change_lock" {
+		partitionID, err := strconv.Atoi(req.FormValue("partition_id"))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid partition ID: %s", err.Error()), http.StatusBadRequest)
+			return
+		}
+
+		locked, err := strconv.ParseBool(req.FormValue("locked"))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid locked value: %s", err.Error()), http.StatusBadRequest)
+			return
+		}
+
+		if err := h.updater.SetPartitionStateChangeLock(req.Context(), int32(partitionID), locked); err != nil {
+			http.Error(w, fmt.Sprintf("failed to lock partition state change: %s", err.Error()), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
@@ -147,12 +210,23 @@ type partitionRingPageData struct {
 
 	// PartitionStateChanges maps the allowed state changes through the UI.
 	PartitionStateChanges map[PartitionState]PartitionState `json:"-"`
+	ShowTokens            bool                              `json:"-"`
 }
 
 type partitionPageData struct {
-	ID             int32          `json:"id"`
-	Corrupted      bool           `json:"corrupted"`
-	State          PartitionState `json:"state"`
-	StateTimestamp time.Time      `json:"state_timestamp"`
-	OwnerIDs       []string       `json:"owner_ids"`
+	ID                int32                `json:"id"`
+	Corrupted         bool                 `json:"corrupted"`
+	State             PartitionState       `json:"state"`
+	StateTimestamp    time.Time            `json:"state_timestamp"`
+	StateChangeLocked bool                 `json:"state_change_locked"`
+	OwnerIDs          []string             `json:"owner_ids"`
+	TokenScheme       PartitionTokenScheme `json:"token_scheme"`
+	Tokens            []uint32             `json:"tokens"`
+	NumTokens         int                  `json:"-"`
+	Ownership         float64              `json:"-"`
+}
+
+// distancePercentage renders a given token distance as the percentage of all possible token values covered by that distance.
+func distancePercentage(distance int64) float64 {
+	return (float64(distance) / float64(math.MaxUint32)) * 100
 }

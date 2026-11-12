@@ -7,11 +7,14 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv/consul"
@@ -30,7 +33,31 @@ const (
 	ringKey = "ring"
 )
 
-func testLifecyclerConfig(ringConfig Config, id string) LifecyclerConfig {
+// TestLifecyclerConfigOption is a function that modifies a LifecyclerConfig for testing purposes.
+type TestLifecyclerConfigOption func(*LifecyclerConfig)
+
+// WithHeartbeatPeriod sets the heartbeat period for the lifecycler config.
+func WithHeartbeatPeriod(period time.Duration) TestLifecyclerConfigOption {
+	return func(cfg *LifecyclerConfig) {
+		cfg.HeartbeatPeriod = period
+	}
+}
+
+// WithJoinAfter sets the join after period for the lifecycler config.
+func WithJoinAfter(period time.Duration) TestLifecyclerConfigOption {
+	return func(cfg *LifecyclerConfig) {
+		cfg.JoinAfter = period
+	}
+}
+
+// WithZone sets the zone for the lifecycler config.
+func WithZone(zone string) TestLifecyclerConfigOption {
+	return func(cfg *LifecyclerConfig) {
+		cfg.Zone = zone
+	}
+}
+
+func testLifecyclerConfig(ringConfig Config, id string, options ...TestLifecyclerConfigOption) LifecyclerConfig {
 	var lifecyclerConfig LifecyclerConfig
 	flagext.DefaultValues(&lifecyclerConfig)
 	lifecyclerConfig.Addr = "0.0.0.0"
@@ -42,6 +69,11 @@ func testLifecyclerConfig(ringConfig Config, id string) LifecyclerConfig {
 	lifecyclerConfig.Zone = zone(1)
 	lifecyclerConfig.FinalSleep = 0
 	lifecyclerConfig.HeartbeatPeriod = 100 * time.Millisecond
+
+	// Apply any provided options
+	for _, option := range options {
+		option(&lifecyclerConfig)
+	}
 
 	return lifecyclerConfig
 }
@@ -55,6 +87,8 @@ func checkNormalised(d interface{}, id string) bool {
 }
 
 func TestLifecyclerConfig_Validate(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -79,6 +113,8 @@ func TestLifecyclerConfig_Validate(t *testing.T) {
 }
 
 func TestLifecycler_TokenGenerator(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -111,6 +147,8 @@ func TestLifecycler_TokenGenerator(t *testing.T) {
 }
 
 func TestLifecycler_HealthyInstancesCount(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -160,7 +198,91 @@ func TestLifecycler_HealthyInstancesCount(t *testing.T) {
 	})
 }
 
+func TestLifecycler_HealthyInstancesInZoneCount(t *testing.T) {
+	t.Parallel()
+
+	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	var ringConfig Config
+	flagext.DefaultValues(&ringConfig)
+	ringConfig.KVStore.Mock = ringStore
+
+	ctx := context.Background()
+
+	// Add the first ingester to the ring
+	lifecyclerConfig1 := testLifecyclerConfig(ringConfig, "ing1")
+	lifecyclerConfig1.HeartbeatPeriod = 100 * time.Millisecond
+	lifecyclerConfig1.JoinAfter = 100 * time.Millisecond
+	lifecyclerConfig1.Zone = "zone-a"
+
+	lifecycler1, err := NewLifecycler(lifecyclerConfig1, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, lifecycler1.HealthyInstancesInZoneCount())
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, lifecycler1))
+	defer services.StopAndAwaitTerminated(ctx, lifecycler1) // nolint:errcheck
+
+	// Assert the first ingester joined the ring
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler1.HealthyInstancesInZoneCount() == 1
+	})
+
+	// Add the second ingester to the ring in the same zone
+	lifecyclerConfig2 := testLifecyclerConfig(ringConfig, "ing2")
+	lifecyclerConfig2.HeartbeatPeriod = 100 * time.Millisecond
+	lifecyclerConfig2.JoinAfter = 100 * time.Millisecond
+	lifecyclerConfig2.Zone = "zone-a"
+
+	lifecycler2, err := NewLifecycler(lifecyclerConfig2, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, lifecycler2.HealthyInstancesInZoneCount())
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, lifecycler2))
+	defer services.StopAndAwaitTerminated(ctx, lifecycler2) // nolint:errcheck
+
+	// Assert the second ingester joined the ring
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler2.HealthyInstancesInZoneCount() == 2
+	})
+
+	// Assert the first ingester count is updated
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler1.HealthyInstancesInZoneCount() == 2
+	})
+
+	// Add the third ingester to the ring in a different zone
+	lifecyclerConfig3 := testLifecyclerConfig(ringConfig, "ing3")
+	lifecyclerConfig3.HeartbeatPeriod = 100 * time.Millisecond
+	lifecyclerConfig3.JoinAfter = 100 * time.Millisecond
+	lifecyclerConfig3.Zone = "zone-b"
+
+	lifecycler3, err := NewLifecycler(lifecyclerConfig3, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, lifecycler3.HealthyInstancesInZoneCount())
+
+	require.NoError(t, services.StartAndAwaitRunning(ctx, lifecycler3))
+	defer services.StopAndAwaitTerminated(ctx, lifecycler3) // nolint:errcheck
+
+	// Assert the third ingester joined the ring
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler3.HealthyInstancesInZoneCount() == 1
+	})
+
+	// Assert the first ingester count is correct
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler1.HealthyInstancesInZoneCount() == 2
+	})
+
+	// Assert the second ingester count is correct
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler2.HealthyInstancesInZoneCount() == 2
+	})
+}
+
 func TestLifecycler_InstancesInZoneCount(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -169,12 +291,13 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 	ringConfig.KVStore.Mock = ringStore
 
 	instances := []struct {
-		zone                          string
-		healthy                       bool
-		expectedInstancesInZoneCount  int
-		expectedInstancesCount        int
-		expectedHealthyInstancesCount int
-		expectedZonesCount            int
+		zone                                string
+		healthy                             bool
+		expectedInstancesInZoneCount        int
+		expectedInstancesCount              int
+		expectedHealthyInstancesCount       int
+		expectedZonesCount                  int
+		expectedHealthyInstancesInZoneCount int
 	}{
 		{
 			zone:    "zone-a",
@@ -187,6 +310,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 1,
 			// after adding a healthy instance in zone-a, expectedZonesCount is 1
 			expectedZonesCount: 1,
+			// after adding a healthy instance in zone-a, expectedHealthyInstancesInZoneCount is 1
+			expectedHealthyInstancesInZoneCount: 1,
 		},
 		{
 			zone:    "zone-a",
@@ -199,6 +324,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 1,
 			// zone-a was already added, so expectedZonesCount remains 1
 			expectedZonesCount: 1,
+			// after adding an unhealthy instance in zone-a, expectedHealthyInstancesInZoneCount remains 1
+			expectedHealthyInstancesInZoneCount: 1,
 		},
 		{
 			zone:    "zone-a",
@@ -211,6 +338,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 2,
 			// zone-a was already added, so expectedZonesCount remains 1
 			expectedZonesCount: 1,
+			// after adding a healthy instance in zone-a, expectedHealthyInstancesInZoneCount becomes 2
+			expectedHealthyInstancesInZoneCount: 2,
 		},
 		{
 			zone:    "zone-b",
@@ -223,6 +352,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 3,
 			// after adding a healthy instance in zone-b, expectedZonesCount becomes 2
 			expectedZonesCount: 2,
+			// after adding a healthy instance in zone-b, expectedHealthyInstancesInZoneCount becomes 1
+			expectedHealthyInstancesInZoneCount: 1,
 		},
 		{
 			zone:    "zone-c",
@@ -235,6 +366,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 3,
 			// after adding an unhealthy instance in zone-c, expectedZonesCount becomes 3
 			expectedZonesCount: 3,
+			// after adding an unhealthy instance in zone-c, expectedHealthyInstancesInZoneCount is 0
+			expectedHealthyInstancesInZoneCount: 0,
 		},
 		{
 			zone:    "zone-c",
@@ -247,6 +380,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 4,
 			// zone-c was already added, so expectedZonesCount remains 3
 			expectedZonesCount: 3,
+			// after adding a healthy instance in zone-c, expectedHealthyInstancesInZoneCount is 1
+			expectedHealthyInstancesInZoneCount: 1,
 		},
 		{
 			zone:    "zone-b",
@@ -259,6 +394,8 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			expectedHealthyInstancesCount: 5,
 			// zone-b was already added, so expectedZonesCount remains 3
 			expectedZonesCount: 3,
+			// after adding a healthy instance in zone-b, expectedHealthyInstancesInZoneCount becomes 2
+			expectedHealthyInstancesInZoneCount: 2,
 		},
 	}
 
@@ -292,14 +429,21 @@ func TestLifecycler_InstancesInZoneCount(t *testing.T) {
 			return lifecycler.HealthyInstancesCount()
 		})
 
+		test.Poll(t, time.Duration(joinWaitMs)*time.Millisecond, instance.expectedHealthyInstancesInZoneCount, func() interface{} {
+			return lifecycler.HealthyInstancesInZoneCount()
+		})
+
 		require.Equal(t, instance.expectedInstancesInZoneCount, lifecycler.InstancesInZoneCount())
 		require.Equal(t, instance.expectedInstancesCount, lifecycler.InstancesCount())
 		require.Equal(t, instance.expectedHealthyInstancesCount, lifecycler.HealthyInstancesCount())
 		require.Equal(t, instance.expectedZonesCount, lifecycler.ZonesCount())
+		require.Equal(t, instance.expectedHealthyInstancesInZoneCount, lifecycler.HealthyInstancesInZoneCount())
 	}
 }
 
 func TestLifecycler_ZonesCount(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -342,7 +486,265 @@ func TestLifecycler_ZonesCount(t *testing.T) {
 	}
 }
 
+func TestLifecycler_Zones(t *testing.T) {
+	t.Parallel()
+
+	t.Run("instances joining different zones", func(t *testing.T) {
+		ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+		t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+		ctx := context.Background()
+		var ringConfig Config
+		flagext.DefaultValues(&ringConfig)
+		ringConfig.KVStore.Mock = ringStore
+
+		events := []struct {
+			zone          string
+			expectedZones []string
+		}{
+			{"zone-a", []string{"zone-a"}},
+			{"zone-b", []string{"zone-a", "zone-b"}},
+			{"zone-a", []string{"zone-a", "zone-b"}},
+			{"zone-c", []string{"zone-a", "zone-b", "zone-c"}},
+		}
+
+		for idx, event := range events {
+			// Register an ingester to the ring.
+			cfg := testLifecyclerConfig(
+				ringConfig,
+				fmt.Sprintf("instance-%d", idx),
+				WithHeartbeatPeriod(100*time.Millisecond),
+				WithJoinAfter(100*time.Millisecond),
+				WithZone(event.zone),
+			)
+
+			lifecycler, err := NewLifecycler(cfg, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+			require.NoError(t, err)
+			assert.Equal(t, 0, lifecycler.ZonesCount())
+
+			require.NoError(t, services.StartAndAwaitRunning(ctx, lifecycler))
+			defer services.StopAndAwaitTerminated(ctx, lifecycler) // nolint:errcheck
+
+			// Wait until joined.
+			test.Poll(t, time.Second, idx+1, func() interface{} {
+				return lifecycler.HealthyInstancesCount()
+			})
+
+			assert.Equal(t, event.expectedZones, lifecycler.Zones())
+		}
+	})
+
+	t.Run("instances leaving zones", func(t *testing.T) {
+		ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+		t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+		var ringConfig Config
+		flagext.DefaultValues(&ringConfig)
+		ringConfig.KVStore.Mock = ringStore
+		ctx := context.Background()
+
+		defaultOpts := []TestLifecyclerConfigOption{
+			WithHeartbeatPeriod(100 * time.Millisecond),
+			WithJoinAfter(100 * time.Millisecond),
+		}
+
+		// Create instances in different zones
+		opts := append(defaultOpts, WithZone("zone-a"))
+		cfg1 := testLifecyclerConfig(ringConfig, "instance-1", opts...)
+
+		opts = append(defaultOpts, WithZone("zone-b"))
+		cfg2 := testLifecyclerConfig(ringConfig, "instance-2", opts...)
+
+		opts = append(defaultOpts, WithZone("zone-c"))
+		cfg3 := testLifecyclerConfig(ringConfig, "instance-3", opts...)
+
+		lc1, err := NewLifecycler(cfg1, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		lc2, err := NewLifecycler(cfg2, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		lc3, err := NewLifecycler(cfg3, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+
+		// Start all instances
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc1))
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc2))
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc3))
+
+		// Wait for all to join
+		test.Poll(t, time.Second, 3, func() interface{} {
+			return lc1.HealthyInstancesCount()
+		})
+
+		// Verify all zones are present
+		assert.Equal(t, []string{"zone-a", "zone-b", "zone-c"}, lc1.Zones())
+		assert.Equal(t, 3, lc1.ZonesCount())
+
+		// Stop instance in zone-b
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc2))
+
+		// Wait for the ring to update and verify zone-b is removed
+		test.Poll(t, time.Second, []string{"zone-a", "zone-c"}, func() interface{} {
+			return lc1.Zones()
+		})
+		assert.Equal(t, 2, lc1.ZonesCount())
+
+		// Stop instance in zone-c
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc3))
+
+		// Wait for the ring to update and verify zone-c is removed
+		test.Poll(t, time.Second, []string{"zone-a"}, func() interface{} {
+			return lc1.Zones()
+		})
+		assert.Equal(t, 1, lc1.ZonesCount())
+
+		// Stop the last instance
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc1))
+	})
+
+	t.Run("multiple instances per zone with some leaving", func(t *testing.T) {
+		ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+		t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+		var ringConfig Config
+		flagext.DefaultValues(&ringConfig)
+		ringConfig.KVStore.Mock = ringStore
+		ctx := context.Background()
+
+		defaultOpts := []TestLifecyclerConfigOption{
+			WithHeartbeatPeriod(100 * time.Millisecond),
+			WithJoinAfter(100 * time.Millisecond),
+		}
+
+		// Create multiple instances in the same zone
+		opts := append(defaultOpts, WithZone("zone-a"))
+		cfg1 := testLifecyclerConfig(ringConfig, "instance-1", opts...)
+
+		opts = append(defaultOpts, WithZone("zone-a"))
+		cfg2 := testLifecyclerConfig(ringConfig, "instance-2", opts...)
+
+		opts = append(defaultOpts, WithZone("zone-b"))
+		cfg3 := testLifecyclerConfig(ringConfig, "instance-3", opts...)
+
+		lc1, err := NewLifecycler(cfg1, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		lc2, err := NewLifecycler(cfg2, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		lc3, err := NewLifecycler(cfg3, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+
+		// Start all instances
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc1))
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc2))
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc3))
+
+		// Wait for all to join
+		test.Poll(t, time.Second, 3, func() interface{} {
+			return lc1.HealthyInstancesCount()
+		})
+
+		// Verify both zones are present
+		assert.Equal(t, []string{"zone-a", "zone-b"}, lc1.Zones())
+		assert.Equal(t, 2, lc1.ZonesCount())
+
+		// Stop one instance in zone-a (but another remains)
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc2))
+
+		// Wait for the ring to update
+		test.Poll(t, time.Second, 2, func() interface{} {
+			return lc1.HealthyInstancesCount()
+		})
+
+		// Zone-a should still be present because lc1 is still running in zone-a
+		assert.Equal(t, []string{"zone-a", "zone-b"}, lc1.Zones())
+		assert.Equal(t, 2, lc1.ZonesCount())
+
+		// Stop the remaining instance in zone-a
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc1))
+
+		// Wait for the ring to update and verify zone-a is removed
+		test.Poll(t, time.Second, []string{"zone-b"}, func() interface{} {
+			return lc3.Zones()
+		})
+		assert.Equal(t, 1, lc3.ZonesCount())
+
+		// Stop the last instance
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc3))
+	})
+
+	t.Run("instances joining and leaving dynamically", func(t *testing.T) {
+		ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+		t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+		var ringConfig Config
+		flagext.DefaultValues(&ringConfig)
+		ringConfig.KVStore.Mock = ringStore
+		ctx := context.Background()
+
+		defaultOpts := []TestLifecyclerConfigOption{
+			WithHeartbeatPeriod(100 * time.Millisecond),
+			WithJoinAfter(100 * time.Millisecond),
+		}
+
+		// Start with one instance
+		opts := append(defaultOpts, WithZone("zone-a"))
+		cfg1 := testLifecyclerConfig(ringConfig, "instance-1", opts...)
+
+		lc1, err := NewLifecycler(cfg1, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc1))
+
+		// Wait for it to join
+		test.Poll(t, time.Second, 1, func() interface{} {
+			return lc1.HealthyInstancesCount()
+		})
+		assert.Equal(t, []string{"zone-a"}, lc1.Zones())
+
+		// Add instance in new zone
+		opts = append(defaultOpts, WithZone("zone-b"))
+		cfg2 := testLifecyclerConfig(ringConfig, "instance-2", opts...)
+
+		lc2, err := NewLifecycler(cfg2, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc2))
+
+		// Wait for it to join
+		test.Poll(t, time.Second, 2, func() interface{} {
+			return lc1.HealthyInstancesCount()
+		})
+		assert.Equal(t, []string{"zone-a", "zone-b"}, lc1.Zones())
+
+		// Remove the first instance
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc1))
+
+		// Wait for the ring to update
+		test.Poll(t, time.Second, []string{"zone-b"}, func() interface{} {
+			return lc2.Zones()
+		})
+		assert.Equal(t, 1, lc2.ZonesCount())
+
+		// Add instance back to zone-a
+		opts = append(defaultOpts, WithZone("zone-a"))
+		cfg3 := testLifecyclerConfig(ringConfig, "instance-3", opts...)
+
+		lc3, err := NewLifecycler(cfg3, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lc3))
+
+		// Wait for it to join
+		test.Poll(t, time.Second, 2, func() interface{} {
+			return lc2.HealthyInstancesCount()
+		})
+		assert.Equal(t, []string{"zone-a", "zone-b"}, lc2.Zones())
+
+		// Clean up
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc2))
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, lc3))
+	})
+}
+
 func TestLifecycler_NilFlushTransferer(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -367,6 +769,8 @@ func TestLifecycler_NilFlushTransferer(t *testing.T) {
 }
 
 func TestLifecycler_TwoRingsWithDifferentKeysOnTheSameKVStore(t *testing.T) {
+	t.Parallel()
+
 	// Create a shared ring
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
@@ -408,6 +812,8 @@ func (f *nopFlushTransferer) TransferOut(_ context.Context) error {
 }
 
 func TestLifecycler_ShouldHandleInstanceAbruptlyRestarted(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -459,6 +865,8 @@ func TestLifecycler_ShouldHandleInstanceAbruptlyRestarted(t *testing.T) {
 }
 
 func TestLifecycler_HeartbeatAfterBackendReset(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	store, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
@@ -497,7 +905,7 @@ func TestLifecycler_HeartbeatAfterBackendReset(t *testing.T) {
 
 	// Now we delete it from the ring to simulate a ring storage reset and we expect the next heartbeat
 	// will restore it.
-	require.NoError(t, store.CAS(ctx, testRingKey, func(in interface{}) (out interface{}, retry bool, err error) {
+	require.NoError(t, store.CAS(ctx, testRingKey, func(interface{}) (out interface{}, retry bool, err error) {
 		return NewDesc(), true, nil
 	}))
 
@@ -522,6 +930,8 @@ func TestLifecycler_HeartbeatAfterBackendReset(t *testing.T) {
 
 // Test Lifecycler when increasing tokens and instance is already in the ring in leaving state.
 func TestLifecycler_IncreasingTokensLeavingInstanceInTheRing(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
@@ -540,20 +950,18 @@ func TestLifecycler_IncreasingTokensLeavingInstanceInTheRing(t *testing.T) {
 	})
 
 	lifecyclerConfig := testLifecyclerConfig(ringConfig, "ing1")
-	// Make sure changes are applied instantly
-	lifecyclerConfig.HeartbeatPeriod = 0
 	lifecyclerConfig.NumTokens = numTokens
 
 	// Simulate ingester with 64 tokens left the ring in LEAVING state
 	origTokens := initTokenGenerator(t).GenerateTokens(64, nil)
-	err = r.KVClient.CAS(ctx, ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
+	err = r.KVClient.CAS(ctx, ringKey, func(interface{}) (out interface{}, retry bool, err error) {
 		ringDesc := NewDesc()
 		addr, err := GetInstanceAddr(lifecyclerConfig.Addr, lifecyclerConfig.InfNames, nil, lifecyclerConfig.EnableInet6)
 		if err != nil {
 			return nil, false, err
 		}
 
-		ringDesc.AddIngester("ing1", addr, lifecyclerConfig.Zone, origTokens, LEAVING, time.Now())
+		ringDesc.AddIngester("ing1", addr, lifecyclerConfig.Zone, origTokens, LEAVING, time.Now(), false, time.Time{}, nil)
 		return ringDesc, false, nil
 	})
 	require.NoError(t, err)
@@ -596,8 +1004,116 @@ func TestLifecycler_IncreasingTokensLeavingInstanceInTheRing(t *testing.T) {
 	}), "tokens should be sorted")
 }
 
+func TestLifecycler_ChangeReadOnlyState(t *testing.T) {
+	t.Parallel()
+
+	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	var ringConfig Config
+	flagext.DefaultValues(&ringConfig)
+	ringConfig.KVStore.Mock = ringStore
+
+	ctx := context.Background()
+
+	createLifecyclerFn := func(id string, reg prometheus.Registerer) *Lifecycler {
+		// Add the first ingester to the ring
+		lifecyclerConfig1 := testLifecyclerConfig(ringConfig, id)
+		lifecyclerConfig1.HeartbeatPeriod = 100 * time.Millisecond
+		lifecyclerConfig1.JoinAfter = 100 * time.Millisecond
+
+		lifecycler, err := NewLifecycler(lifecyclerConfig1, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), reg)
+		require.NoError(t, err)
+		assert.Equal(t, 0, lifecycler.HealthyInstancesCount())
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lifecycler))
+		t.Cleanup(func() {
+			assert.NoError(t, services.StopAndAwaitTerminated(ctx, lifecycler))
+		})
+		return lifecycler
+	}
+
+	reg := prometheus.NewRegistry()
+	lifecycler1 := createLifecyclerFn("ing1", reg)
+	lifecycler2 := createLifecyclerFn("ing2", nil)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP lifecycler_read_only Set to 1 if this lifecycler's instance entry is in read-only state.
+		# TYPE lifecycler_read_only gauge
+		lifecycler_read_only{name="ingester"} 0
+	`), "lifecycler_read_only"))
+
+	// Assert the ingester has joined both rings
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler1.HealthyInstancesCount() == 2 && lifecycler2.HealthyInstancesCount() == 2
+	})
+
+	ro, ts := lifecycler1.GetReadOnlyState()
+	require.False(t, ro)
+	require.Zero(t, ts)
+	require.NoError(t, lifecycler1.ChangeReadOnlyState(ctx, true))
+
+	ro, ts = lifecycler1.GetReadOnlyState()
+	require.True(t, ro)
+	require.NotZero(t, ts)
+
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+		# HELP lifecycler_read_only Set to 1 if this lifecycler's instance entry is in read-only state.
+		# TYPE lifecycler_read_only gauge
+		lifecycler_read_only{name="ingester"} 1
+	`), "lifecycler_read_only"))
+
+	// Assert the ingester has changed to read only
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler1.ReadOnlyInstancesCount() == 1 && lifecycler2.ReadOnlyInstancesCount() == 1
+	})
+}
+
+func TestLifecycler_StartingWithReadOnlyInstanceInRing(t *testing.T) {
+	t.Parallel()
+
+	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
+	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
+
+	var ringConfig Config
+	flagext.DefaultValues(&ringConfig)
+	ringConfig.KVStore.Mock = ringStore
+
+	ctx := context.Background()
+
+	createLifecyclerFn := func(id string) *Lifecycler {
+		// Add the first ingester to the ring
+		lifecyclerConfig1 := testLifecyclerConfig(ringConfig, id)
+		lifecyclerConfig1.HeartbeatPeriod = 100 * time.Millisecond
+		lifecyclerConfig1.JoinAfter = 100 * time.Millisecond
+
+		lifecycler, err := NewLifecycler(lifecyclerConfig1, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
+		require.NoError(t, err)
+		assert.Equal(t, 0, lifecycler.HealthyInstancesCount())
+		require.NoError(t, services.StartAndAwaitRunning(ctx, lifecycler))
+		t.Cleanup(func() {
+			assert.NoError(t, services.StopAndAwaitTerminated(ctx, lifecycler))
+		})
+		return lifecycler
+	}
+
+	lifecycler1 := createLifecyclerFn("ing1")
+	require.NoError(t, lifecycler1.ChangeReadOnlyState(ctx, true))
+	// Assert the ingester has changed to read only
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler1.HealthyInstancesCount() == 1 && lifecycler1.ReadOnlyInstancesCount() == 1
+	})
+
+	// Assert the second ingester joins the ring and sees the first ingester as read only
+	lifecycler2 := createLifecyclerFn("ing2")
+	test.Poll(t, time.Second, true, func() interface{} {
+		return lifecycler2.HealthyInstancesCount() == 2 && lifecycler2.ReadOnlyInstancesCount() == 1
+	})
+}
+
 // Test Lifecycler when decreasing tokens and instance is already in the ring in leaving state.
 func TestLifecycler_DecreasingTokensLeavingInstanceInTheRing(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
@@ -616,20 +1132,18 @@ func TestLifecycler_DecreasingTokensLeavingInstanceInTheRing(t *testing.T) {
 	})
 
 	lifecyclerConfig := testLifecyclerConfig(ringConfig, "ing1")
-	// Make sure changes are applied instantly
-	lifecyclerConfig.HeartbeatPeriod = 0
 	lifecyclerConfig.NumTokens = numTokens
 
 	// Simulate ingester with 128 tokens left the ring in LEAVING state
 	origTokens := initTokenGenerator(t).GenerateTokens(128, nil)
-	err = r.KVClient.CAS(ctx, ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
+	err = r.KVClient.CAS(ctx, ringKey, func(interface{}) (out interface{}, retry bool, err error) {
 		ringDesc := NewDesc()
 		addr, err := GetInstanceAddr(lifecyclerConfig.Addr, lifecyclerConfig.InfNames, nil, lifecyclerConfig.EnableInet6)
 		if err != nil {
 			return nil, false, err
 		}
 
-		ringDesc.AddIngester("ing1", addr, lifecyclerConfig.Zone, origTokens, LEAVING, time.Now())
+		ringDesc.AddIngester("ing1", addr, lifecyclerConfig.Zone, origTokens, LEAVING, time.Now(), false, time.Time{}, nil)
 		return ringDesc, false, nil
 	})
 	require.NoError(t, err)
@@ -733,6 +1247,8 @@ func (m *MockClient) WatchPrefix(ctx context.Context, prefix string, f func(stri
 
 // Ensure a check ready returns error when consul returns a nil key and the ingester already holds keys. This happens if the ring key gets deleted
 func TestCheckReady_NoRingInKVStore(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	var ringConfig Config
@@ -764,6 +1280,8 @@ func TestCheckReady_NoRingInKVStore(t *testing.T) {
 }
 
 func TestCheckReady_MinReadyDuration(t *testing.T) {
+	t.Parallel()
+
 	tests := map[string]struct {
 		minReadyDuration time.Duration
 		expectedMinDelay time.Duration
@@ -823,6 +1341,8 @@ func TestCheckReady_MinReadyDuration(t *testing.T) {
 }
 
 func TestCheckReady_CheckRingHealth(t *testing.T) {
+	t.Parallel()
+
 	tests := map[string]struct {
 		checkRingHealthEnabled bool
 		firstJoinAfter         time.Duration
@@ -891,8 +1411,8 @@ func TestCheckReady_CheckRingHealth(t *testing.T) {
 
 			// Wait until both instances are registered in the ring. We expect them to be registered
 			// immediately and then switch to ACTIVE after the configured auto join delay.
-			waitRingInstance(t, 3*time.Second, l1, func(instance InstanceDesc) error { return nil })
-			waitRingInstance(t, 3*time.Second, l2, func(instance InstanceDesc) error { return nil })
+			waitRingInstance(t, 3*time.Second, l1, func(InstanceDesc) error { return nil })
+			waitRingInstance(t, 3*time.Second, l2, func(InstanceDesc) error { return nil })
 
 			// Poll the readiness check until ready and measure how much time it takes.
 			test.Poll(t, 5*time.Second, nil, func() interface{} {
@@ -911,111 +1431,9 @@ type noopFlushTransferer struct {
 func (f *noopFlushTransferer) Flush()                              {}
 func (f *noopFlushTransferer) TransferOut(_ context.Context) error { return nil }
 
-func TestRestartIngester_DisabledHeartbeat_unregister_on_shutdown_false(t *testing.T) {
-	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
-	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
-
-	var ringConfig Config
-	flagext.DefaultValues(&ringConfig)
-	ringConfig.KVStore.Mock = ringStore
-
-	r, err := New(ringConfig, "ingester", ringKey, log.NewNopLogger(), nil)
-	require.NoError(t, err)
-	require.NoError(t, services.StartAndAwaitRunning(context.Background(), r))
-	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
-
-	// poll function waits for a condition and returning actual state of the ingesters after the condition succeed.
-	poll := func(condition func(*Desc) bool) map[string]InstanceDesc {
-		var ingesters map[string]InstanceDesc
-		test.Poll(t, 5*time.Second, true, func() interface{} {
-			d, err := r.KVClient.Get(context.Background(), ringKey)
-			require.NoError(t, err)
-
-			desc, ok := d.(*Desc)
-
-			if ok {
-				ingesters = desc.Ingesters
-			}
-			return ok && condition(desc)
-		})
-
-		return ingesters
-	}
-
-	// Starts Ingester and wait it to became active
-	startIngesterAndWaitActive := func(ingId string) *Lifecycler {
-		lifecyclerConfig := testLifecyclerConfig(ringConfig, ingId)
-		// Disabling heartBeat and unregister_on_shutdown
-		lifecyclerConfig.UnregisterOnShutdown = false
-		lifecyclerConfig.HeartbeatPeriod = 0
-		lifecycler, err := NewLifecycler(lifecyclerConfig, &noopFlushTransferer{}, "lifecycler", ringKey, true, log.NewNopLogger(), nil)
-		require.NoError(t, err)
-		require.NoError(t, services.StartAndAwaitRunning(context.Background(), lifecycler))
-		poll(func(desc *Desc) bool {
-			return desc.Ingesters[ingId].State == ACTIVE
-		})
-		return lifecycler
-	}
-
-	// We are going to create 2 fake ingester with disabled heart beat and `unregister_on_shutdown=false` then
-	// test if the ingester 2 became active after:
-	// * Clean Shutdown (LEAVING after shutdown)
-	// * Crashes while in the PENDING or JOINING state
-	l1 := startIngesterAndWaitActive("ing1")
-	defer services.StopAndAwaitTerminated(context.Background(), l1) //nolint:errcheck
-
-	l2 := startIngesterAndWaitActive("ing2")
-
-	ingesters := poll(func(desc *Desc) bool {
-		return len(desc.Ingesters) == 2 && desc.Ingesters["ing1"].State == ACTIVE && desc.Ingesters["ing2"].State == ACTIVE
-	})
-
-	// Both Ingester should be active and running
-	assert.Equal(t, ACTIVE, ingesters["ing1"].State)
-	assert.Equal(t, ACTIVE, ingesters["ing2"].State)
-
-	// Stop One ingester gracefully should leave it on LEAVING STATE on the ring
-	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), l2))
-
-	ingesters = poll(func(desc *Desc) bool {
-		return len(desc.Ingesters) == 2 && desc.Ingesters["ing2"].State == LEAVING
-	})
-	assert.Equal(t, LEAVING, ingesters["ing2"].State)
-
-	// Start Ingester2 again - Should flip back to ACTIVE in the ring
-	l2 = startIngesterAndWaitActive("ing2")
-	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), l2))
-
-	// Simulate ingester2 crash on startup and left the ring with JOINING state
-	err = r.KVClient.CAS(context.Background(), ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
-		desc, ok := in.(*Desc)
-		require.True(t, ok)
-		ingester2Desc := desc.Ingesters["ing2"]
-		ingester2Desc.State = JOINING
-		desc.Ingesters["ing2"] = ingester2Desc
-		return desc, true, nil
-	})
-	require.NoError(t, err)
-
-	l2 = startIngesterAndWaitActive("ing2")
-	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), l2))
-
-	// Simulate ingester2 crash on startup and left the ring with PENDING state
-	err = r.KVClient.CAS(context.Background(), ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
-		desc, ok := in.(*Desc)
-		require.True(t, ok)
-		ingester2Desc := desc.Ingesters["ing2"]
-		ingester2Desc.State = PENDING
-		desc.Ingesters["ing2"] = ingester2Desc
-		return desc, true, nil
-	})
-	require.NoError(t, err)
-
-	l2 = startIngesterAndWaitActive("ing2")
-	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), l2))
-}
-
 func TestRestartIngester_NoUnregister_LongHeartbeat(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -1027,7 +1445,7 @@ func TestRestartIngester_NoUnregister_LongHeartbeat(t *testing.T) {
 	err := ringStore.CAS(context.Background(), ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
 		// Create ring with LEAVING entry with some tokens
 		r := GetOrCreateRingDesc(in)
-		r.AddIngester(id, "3.3.3.3:333", "old", origTokens, LEAVING, registeredAt)
+		r.AddIngester(id, "3.3.3.3:333", "old", origTokens, LEAVING, registeredAt, false, time.Time{}, nil)
 		return r, true, err
 	})
 	require.NoError(t, err)
@@ -1072,6 +1490,8 @@ func TestRestartIngester_NoUnregister_LongHeartbeat(t *testing.T) {
 }
 
 func TestTokensOnDisk(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -1192,6 +1612,8 @@ func TestDeletePersistedTokensOnShutdown(t *testing.T) {
 
 // JoinInLeavingState ensures that if the lifecycler starts up and the ring already has it in a LEAVING state that it still is able to auto join
 func TestJoinInLeavingState(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -1209,7 +1631,7 @@ func TestJoinInLeavingState(t *testing.T) {
 	cfg.MinReadyDuration = 1 * time.Nanosecond
 
 	// Set state as LEAVING
-	err = r.KVClient.CAS(context.Background(), ringKey, func(in interface{}) (interface{}, bool, error) {
+	err = r.KVClient.CAS(context.Background(), ringKey, func(interface{}) (interface{}, bool, error) {
 		r := &Desc{
 			Ingesters: map[string]InstanceDesc{
 				"ing1": {
@@ -1247,6 +1669,8 @@ func TestJoinInLeavingState(t *testing.T) {
 
 // JoinInJoiningState ensures that if the lifecycler starts up and the ring already has it in a JOINING state that it still is able to auto join
 func TestJoinInJoiningState(t *testing.T) {
+	t.Parallel()
+
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
 	t.Cleanup(func() { assert.NoError(t, closer.Close()) })
 
@@ -1266,7 +1690,7 @@ func TestJoinInJoiningState(t *testing.T) {
 	instance2RegisteredAt := time.Now().Add(-2 * time.Hour)
 
 	// Set state as JOINING
-	err = r.KVClient.CAS(context.Background(), ringKey, func(in interface{}) (interface{}, bool, error) {
+	err = r.KVClient.CAS(context.Background(), ringKey, func(interface{}) (interface{}, bool, error) {
 		r := &Desc{
 			Ingesters: map[string]InstanceDesc{
 				"ing1": {
@@ -1321,7 +1745,7 @@ func TestWaitBeforeJoining(t *testing.T) {
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), r))
 	defer services.StopAndAwaitTerminated(context.Background(), r) //nolint:errcheck
 
-	err = r.KVClient.CAS(context.Background(), ringKey, func(in interface{}) (interface{}, bool, error) {
+	err = r.KVClient.CAS(context.Background(), ringKey, func(interface{}) (interface{}, bool, error) {
 		r := &Desc{
 			Ingesters: map[string]InstanceDesc{
 				instanceName(0, 1): {
@@ -1382,40 +1806,49 @@ func TestWaitBeforeJoining(t *testing.T) {
 		},
 	}
 
-	for _, testData := range tests {
-		ctx, cancel := context.WithCancel(context.Background())
-		targetInstanceID := testData.targetInstanceID
-		cfg := testLifecyclerConfig(ringConfig, targetInstanceID)
-		cfg.NumTokens = optimalTokensPerInstance
-		cfg.RingTokenGenerator = testData.tokenGenerator
-		l, err := NewLifecycler(cfg, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
-		require.NoError(t, err)
-		l.canJoinTimeout = canJoinTimeout
-		require.NoError(t, services.StartAndAwaitRunning(ctx, l))
-
-		if testData.errorRequired {
-			cancel()
-		}
-		start := time.Now()
-		err = l.waitBeforeJoining(ctx)
-		if testData.errorRequired {
-			require.Error(t, err)
-		} else {
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			targetInstanceID := testData.targetInstanceID
+			cfg := testLifecyclerConfig(ringConfig, targetInstanceID)
+			cfg.NumTokens = optimalTokensPerInstance
+			cfg.RingTokenGenerator = testData.tokenGenerator
+			l, err := NewLifecycler(cfg, &nopFlushTransferer{}, "ingester", ringKey, true, log.NewNopLogger(), nil)
 			require.NoError(t, err)
+			l.canJoinTimeout = canJoinTimeout
+
+			// Emulate running loop() method control flow;
+			// there is no starting method and all stages of the service happens in running method.
+			// The different stages cannot be tested without race conditions if using StartAndAwaitRunning.
+			require.NoError(t, l.initRing(context.Background()))
+
+			start := time.Now()
+
+			if testData.errorRequired {
+				cancel()
+			}
+			err = l.waitBeforeJoining(ctx)
+
+			if testData.errorRequired {
+				require.ErrorIs(t, err, context.Canceled)
+			} else {
+				require.NoError(t, err)
+			}
 
 			if testData.timeoutRequired {
 				require.GreaterOrEqual(t, time.Since(start), canJoinTimeout)
 			} else {
 				require.Less(t, time.Since(start), canJoinTimeout)
 			}
-		}
-		err = services.StopAndAwaitTerminated(context.Background(), l)
-		require.NoError(t, err)
-		cancel()
+
+			cancel()
+		})
 	}
 }
 
 func TestAutoJoinWithSpreadMinimizingTokenGenerator(t *testing.T) {
+	t.Parallel()
+
 	canJoinDelay := 1 * time.Second
 	canJoinTimeout := 5 * time.Second
 	ringStore, closer := consul.NewInMemoryClient(GetCodec(), log.NewNopLogger(), nil)
@@ -1511,6 +1944,8 @@ func instanceName(instanceID, zoneID int) string {
 }
 
 func TestRestoreOfZoneWhenOverwritten(t *testing.T) {
+	t.Parallel()
+
 	// This test is simulating a case during upgrade of pre 1.0 cortex where
 	// older ingesters do not have the zone field in their ring structs
 	// so it gets removed. The current version of the lifecylcer should
@@ -1531,7 +1966,7 @@ func TestRestoreOfZoneWhenOverwritten(t *testing.T) {
 	cfg := testLifecyclerConfig(ringConfig, "ing1")
 
 	// Set ing1 to not have a zone
-	err = r.KVClient.CAS(context.Background(), ringKey, func(in interface{}) (interface{}, bool, error) {
+	err = r.KVClient.CAS(context.Background(), ringKey, func(interface{}) (interface{}, bool, error) {
 		r := &Desc{
 			Ingesters: map[string]InstanceDesc{
 				"ing1": {
@@ -1589,6 +2024,8 @@ func waitRingInstance(t *testing.T, timeout time.Duration, l *Lifecycler, check 
 }
 
 func TestDefaultFinalSleepValue(t *testing.T) {
+	t.Parallel()
+
 	t.Run("default value is 0", func(t *testing.T) {
 		cfg := &LifecyclerConfig{}
 		flagext.DefaultValues(cfg)

@@ -24,27 +24,54 @@ var defaultPageTemplate = template.Must(template.New("webpage").Funcs(template.F
 		if t.IsZero() {
 			return ""
 		}
-		return t.Format(time.RFC3339Nano)
+		return t.Format(time.RFC3339)
 	},
-	"durationSince": func(t time.Time) string { return time.Since(t).Truncate(time.Millisecond).String() },
+	"durationSince": func(t time.Time) string { return time.Since(t).Truncate(time.Second).String() },
 }).Parse(defaultPageContent))
 
 type httpResponse struct {
-	Ingesters  []ingesterDesc `json:"shards"`
-	Now        time.Time      `json:"now"`
-	ShowTokens bool           `json:"-"`
+	Ingesters []ingesterDesc `json:"shards"`
+	Now       time.Time      `json:"now"`
+	// TokensToggledOn indicates whether the Show Tokens button is clicked.
+	TokensToggledOn bool             `json:"-"`
+	Config          StatusPageConfig `json:"-"`
 }
 
 type ingesterDesc struct {
-	ID                  string    `json:"id"`
-	State               string    `json:"state"`
-	Address             string    `json:"address"`
-	HeartbeatTimestamp  time.Time `json:"timestamp"`
-	RegisteredTimestamp time.Time `json:"registered_timestamp"`
-	Zone                string    `json:"zone"`
-	Tokens              []uint32  `json:"tokens"`
-	NumTokens           int       `json:"-"`
-	Ownership           float64   `json:"-"`
+	ID                       string            `json:"id"`
+	Link                     string            `json:"-"`
+	State                    string            `json:"state"`
+	Address                  string            `json:"address"`
+	HeartbeatTimestamp       time.Time         `json:"timestamp"`
+	RegisteredTimestamp      time.Time         `json:"registered_timestamp"`
+	ReadOnly                 bool              `json:"read_only"`
+	ReadOnlyUpdatedTimestamp time.Time         `json:"read_only_updated_timestamp"`
+	Zone                     string            `json:"zone"`
+	Tokens                   []uint32          `json:"tokens"`
+	NumTokens                int               `json:"-"`
+	Ownership                float64           `json:"-"`
+	Versions                 map[uint64]uint64 `json:"versions,omitempty"`
+}
+
+// StatusPageConfig configures the ring status page.
+//
+// Given the values are only used to configure the status page, it is safe to change them between
+// releases or have different values on different members of the same ring.
+type StatusPageConfig struct {
+	// HideTokensUIElements allows tokens to be hidden from the status page, for use in contexts which do not utilize tokens.
+	HideTokensUIElements bool `yaml:"-" json:"-"`
+
+	// ShowVersions enables displaying versions on the status page.
+	ShowVersions bool `yaml:"-" json:"-"`
+
+	// ComponentNames are the names of the components in InstanceDesc.Versions, used only for display on the status page.
+	// If a component in Versions has no name in ComponentNames, then the version will be shown on the status page
+	// without a name.
+	ComponentNames map[uint64]string `yaml:"-" json:"-"`
+
+	// InstanceLink returns the link of an instance on the status page.
+	// If InstanceLink is nil or returns an empty string, the instance has no link.
+	InstanceLink func(instanceID string, instance InstanceDesc) string `yaml:"-" json:"-"`
 }
 
 type ringAccess interface {
@@ -55,12 +82,14 @@ type ringAccess interface {
 type ringPageHandler struct {
 	r                ringAccess
 	heartbeatTimeout time.Duration
+	config           StatusPageConfig
 }
 
-func newRingPageHandler(r ringAccess, heartbeatTimeout time.Duration) *ringPageHandler {
+func newRingPageHandler(r ringAccess, heartbeatTimeout time.Duration, config StatusPageConfig) *ringPageHandler {
 	return &ringPageHandler{
 		r:                r,
 		heartbeatTimeout: heartbeatTimeout,
+		config:           config,
 	}
 }
 
@@ -110,25 +139,37 @@ func (h *ringPageHandler) handle(w http.ResponseWriter, req *http.Request) {
 			state = "UNHEALTHY"
 		}
 
+		ro, rots := ing.GetReadOnlyState()
+
+		var link string
+		if h.config.InstanceLink != nil {
+			link = h.config.InstanceLink(id, ing)
+		}
+
 		ingesters = append(ingesters, ingesterDesc{
-			ID:                  id,
-			State:               state,
-			Address:             ing.Addr,
-			HeartbeatTimestamp:  time.Unix(ing.Timestamp, 0).UTC(),
-			RegisteredTimestamp: ing.GetRegisteredAt().UTC(),
-			Tokens:              ing.Tokens,
-			Zone:                ing.Zone,
-			NumTokens:           len(ing.Tokens),
-			Ownership:           (float64(ownedTokens[id]) / float64(math.MaxUint32)) * 100,
+			ID:                       id,
+			Link:                     link,
+			State:                    state,
+			Address:                  ing.Addr,
+			HeartbeatTimestamp:       time.Unix(ing.Timestamp, 0).UTC(),
+			RegisteredTimestamp:      ing.GetRegisteredAt().UTC(),
+			ReadOnly:                 ro,
+			ReadOnlyUpdatedTimestamp: rots.UTC(),
+			Tokens:                   ing.Tokens,
+			Zone:                     ing.Zone,
+			NumTokens:                len(ing.Tokens),
+			Ownership:                (float64(ownedTokens[id]) / float64(math.MaxUint32)) * 100,
+			Versions:                 ing.Versions,
 		})
 	}
 
 	tokensParam := req.URL.Query().Get("tokens")
 
 	renderHTTPResponse(w, httpResponse{
-		Ingesters:  ingesters,
-		Now:        now,
-		ShowTokens: tokensParam == "true",
+		Ingesters:       ingesters,
+		Now:             now,
+		TokensToggledOn: tokensParam == "true",
+		Config:          h.config,
 	}, defaultPageTemplate, req)
 }
 

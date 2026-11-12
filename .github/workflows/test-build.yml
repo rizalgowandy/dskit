@@ -1,0 +1,79 @@
+name: CI
+# This workflow runs on pull_request, which includes PRs from forks. It must
+# remain free of repository secrets and must NOT switch to pull_request_target,
+# otherwise untrusted fork code would gain access to write-capable tokens.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+    inputs:
+      concurrency-group:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel any running workflow for the same branch when new commits are pushed.
+  # We group both by ref_name (available when CI is triggered by a push to a branch/tag)
+  # and head_ref (available when CI is triggered by a PR).
+  group: "${{ github.ref_name }}-${{ github.head_ref }}${{ inputs.concurrency-group }}"
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.x'
+      - name: Go mod check
+        run: make mod-check
+      - name: Build submodules
+        run: make build-submodules
+      - name: Lint
+        run: make lint
+      - name: Test benchmarks
+        run: make test-benchmarks
+      - name: Check protos
+        run: |
+          go mod vendor
+          make check-protos
+
+  test:
+    name: "Test (go=${{ matrix.go-version }}, group=${{ matrix.test_group_id }}/${{ matrix.test_group_total }})"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # We want to make sure dskit can support multiple golang versions
+        # by ensuring the test would pass using all these supported versions.
+        go-version: ['1.26.x', '1.27.x']
+        # Split tests into 3 groups by *_test.go file (each group runs matching
+        # Test*/Fuzz*/Example* names via -run), with per-package retry.
+        test_group_id:    [0, 1, 2]
+        test_group_total: [3]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ matrix.go-version }}
+          # Runners may ship an older cached patch release than the go directive in go.mod requires.
+          check-latest: true
+      - name: Display Go version
+        run: go version
+      - name: Test
+        run: |
+          echo "Running unit tests (group ${{ matrix.test_group_id }} of ${{ matrix.test_group_total }}) with Go version: $(go version)"
+          ./.github/workflows/scripts/run-unit-tests-group.sh --index ${{ matrix.test_group_id }} --total ${{ matrix.test_group_total }}

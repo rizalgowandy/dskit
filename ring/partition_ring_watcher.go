@@ -18,32 +18,72 @@ import (
 type PartitionRingWatcher struct {
 	services.Service
 
-	key    string
-	kv     kv.Client
-	logger log.Logger
+	key      string
+	kv       kv.Client
+	delegate PartitionRingWatcherDelegate
+	logger   log.Logger
 
 	ringMx sync.Mutex
 	ring   *PartitionRing
 
 	// Metrics.
-	numPartitionsGaugeVec *prometheus.GaugeVec
+	numPartitionsGaugeVec      *prometheus.GaugeVec
+	maxPartitionIDGauge        prometheus.Gauge
+	maxDerivedPartitionIDGauge prometheus.Gauge
+
+	// opts is used to propagate the options each time the ring is updated.
+	opts PartitionRingOptions
+}
+
+type PartitionRingWatcherDelegate interface {
+	// OnPartitionRingChanged provides the old and new partition ring descriptions, which must not be modified.
+	OnPartitionRingChanged(oldRing, newRing *PartitionRingDesc)
 }
 
 func NewPartitionRingWatcher(name, key string, kv kv.Client, logger log.Logger, reg prometheus.Registerer) *PartitionRingWatcher {
+	return NewPartitionRingWatcherWithOptions(name, key, kv, DefaultPartitionRingOptions(), logger, reg)
+}
+
+func NewPartitionRingWatcherWithOptions(name, key string, kv kv.Client, opts PartitionRingOptions, logger log.Logger, reg prometheus.Registerer) *PartitionRingWatcher {
+	emptyRing, err := NewPartitionRingWithOptions(*NewPartitionRingDesc(), opts)
+	if err != nil {
+		panic(err) // This should never executes.
+	}
 	r := &PartitionRingWatcher{
 		key:    key,
 		kv:     kv,
 		logger: logger,
-		ring:   NewPartitionRing(*NewPartitionRingDesc()),
+		ring:   emptyRing,
 		numPartitionsGaugeVec: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 			Name:        "partition_ring_partitions",
 			Help:        "Number of partitions by state in the partitions ring.",
 			ConstLabels: map[string]string{"name": name},
 		}, []string{"state"}),
+		maxPartitionIDGauge: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name:        "partition_ring_max_partition_id",
+			Help:        "Highest partition ID in the ring, or -1 when empty.",
+			ConstLabels: map[string]string{"name": name},
+		}),
+		maxDerivedPartitionIDGauge: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name:        "partition_ring_max_derived_partition_id",
+			Help:        "Highest partition ID using derived tokens in the ring, or -1 when none.",
+			ConstLabels: map[string]string{"name": name},
+		}),
+		opts: opts,
 	}
 
+	r.maxPartitionIDGauge.Set(-1)
+	r.maxDerivedPartitionIDGauge.Set(-1)
 	r.Service = services.NewBasicService(r.starting, r.loop, nil).WithName("partitions-ring-watcher")
 	return r
+}
+
+// WithDelegate adds the delegate to be called when the partition ring changes.
+//
+// Not concurrency safe.
+func (w *PartitionRingWatcher) WithDelegate(delegate PartitionRingWatcherDelegate) *PartitionRingWatcher {
+	w.delegate = delegate
+	return w
 }
 
 func (w *PartitionRingWatcher) starting(ctx context.Context) error {
@@ -60,34 +100,67 @@ func (w *PartitionRingWatcher) starting(ctx context.Context) error {
 		value = NewPartitionRingDesc()
 	}
 
-	w.updatePartitionRing(value.(*PartitionRingDesc))
-	return nil
+	return w.updatePartitionRing(value.(*PartitionRingDesc))
 }
 
 func (w *PartitionRingWatcher) loop(ctx context.Context) error {
+	var watchErr error
 	w.kv.WatchKey(ctx, w.key, func(value interface{}) bool {
 		if value == nil {
 			level.Info(w.logger).Log("msg", "partition ring doesn't exist in KV store yet")
 			return true
 		}
 
-		w.updatePartitionRing(value.(*PartitionRingDesc))
+		if err := w.updatePartitionRing(value.(*PartitionRingDesc)); err != nil {
+			watchErr = err
+			return false
+		}
 		return true
 	})
-	return nil
+	return watchErr
 }
 
-func (w *PartitionRingWatcher) updatePartitionRing(desc *PartitionRingDesc) {
-	newRing := NewPartitionRing(*desc)
-
+func (w *PartitionRingWatcher) updatePartitionRing(desc *PartitionRingDesc) error {
+	newRing, err := NewPartitionRingWithOptions(*desc, w.opts)
+	if err != nil {
+		return errors.Wrap(err, "failed to create partition ring from descriptor")
+	}
 	w.ringMx.Lock()
+	oldRing := w.ring
 	w.ring = newRing
 	w.ringMx.Unlock()
 
+	if w.delegate != nil {
+		w.delegate.OnPartitionRingChanged(&oldRing.desc, desc)
+	}
+
 	// Update metrics.
+	maxDerivedPartitionID := int32(-1)
+	for id, partition := range desc.Partitions {
+		if partition.TokenScheme == PartitionTokensSmt512 && id > maxDerivedPartitionID {
+			maxDerivedPartitionID = id
+		}
+	}
+	w.maxPartitionIDGauge.Set(float64(newRing.maxPartitionID))
+	w.maxDerivedPartitionIDGauge.Set(float64(maxDerivedPartitionID))
 	for state, count := range desc.countPartitionsByState() {
 		w.numPartitionsGaugeVec.WithLabelValues(state.CleanName()).Set(float64(count))
 	}
+
+	// Check partitions whose state change lock status has changed and log them.
+	for partitionID, partition := range desc.Partitions {
+		state := partition.GetState().CleanName()
+
+		oldPartition, existedBefore := oldRing.desc.Partitions[partitionID]
+		if !existedBefore || partition.StateChangeLocked != oldPartition.StateChangeLocked {
+			if partition.StateChangeLocked {
+				level.Warn(w.logger).Log("msg", "partition state change is locked", "partition_id", partitionID, "partition_state", state)
+			} else if existedBefore {
+				level.Info(w.logger).Log("msg", "partition state change is unlocked", "partition_id", partitionID, "partition_state", state)
+			}
+		}
+	}
+	return nil
 }
 
 // PartitionRing returns the most updated snapshot of the PartitionRing. The returned instance

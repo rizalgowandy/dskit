@@ -31,12 +31,28 @@ func (t *SpanlessTracingCache) SetMultiAsync(data map[string][]byte, ttl time.Du
 	t.next.SetMultiAsync(data, ttl)
 }
 
+func (t *SpanlessTracingCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return t.next.Set(ctx, key, value, ttl)
+}
+
+func (t *SpanlessTracingCache) Add(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return t.next.Add(ctx, key, value, ttl)
+}
+
 func (t *SpanlessTracingCache) GetMulti(ctx context.Context, keys []string, opts ...Option) (result map[string][]byte) {
+	result, err := t.GetMultiWithError(ctx, keys, opts...)
+	if err != nil {
+		level.Warn(t.logger).Log("msg", "failed to get items from cache", "err", err)
+	}
+	return
+}
+
+func (t *SpanlessTracingCache) GetMultiWithError(ctx context.Context, keys []string, opts ...Option) (result map[string][]byte, err error) {
 	var (
 		bytes  int
 		logger = spanlogger.FromContext(ctx, t.logger, t.resolver)
 	)
-	result = t.next.GetMulti(ctx, keys, opts...)
+	result, err = t.next.GetMultiWithError(ctx, keys, opts...)
 
 	for _, v := range result {
 		bytes += len(v)

@@ -9,11 +9,14 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	consul "github.com/hashicorp/consul/api"
+	consul "github.com/hashicorp/consul/api/v2"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/grafana/dskit/kv/codec"
 )
+
+// The max wait time allowed for mockKV operations, in order to have faster tests.
+const maxWaitTime = 100 * time.Millisecond
 
 type mockKV struct {
 	mtx     sync.Mutex
@@ -87,7 +90,7 @@ func (m *mockKV) loop() {
 		select {
 		case <-m.close:
 			return
-		case <-time.After(time.Second):
+		case <-time.After(maxWaitTime):
 			m.mtx.Lock()
 			m.cond.Broadcast()
 			m.mtx.Unlock()
@@ -258,7 +261,6 @@ func (m *mockKV) ResetIndexForKey(key string) {
 // mockedMaxWaitTime returns the minimum duration between the input duration
 // and the max wait time allowed in this mock, in order to have faster tests.
 func mockedMaxWaitTime(queryWaitTime time.Duration) time.Duration {
-	const maxWaitTime = time.Second
 	if queryWaitTime > maxWaitTime {
 		return maxWaitTime
 	}

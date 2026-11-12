@@ -1,25 +1,70 @@
-output:
-  format: line-number
-
-linters:
-  enable:
-    - goimports
-    - gofmt
-    - misspell
-    - revive
-
-linters-settings:
-  errcheck:
-    # path to a file containing a list of functions to exclude from checking
-    # see https://github.com/kisielk/errcheck#excluding-functions for details
-    exclude: ./.errcheck-exclude
-  goimports:
-    local-prefixes: "github.com/grafana/dskit"
-
+version: "2"
 run:
   timeout: 5m
-
   # List of build tags, all linters use it.
   build-tags:
     - netgo
     - requires_docker
+output:
+  formats:
+    text:
+      path: stdout
+      colors: false
+linters:
+  enable:
+    - depguard
+    - forbidigo
+    - loggercheck
+    - misspell
+    - revive
+  settings:
+    depguard:
+      rules:
+        deprecated:
+          deny:
+            - pkg: github.com/bmizerany/assert$
+              desc: use github.com/stretchr/testify/assert
+            - pkg: golang.org/x/net/context$
+              desc: use context
+            - pkg: sync/atomic$
+              desc: use go.uber.org/atomic
+            - pkg: github.com/go-kit/kit/log$
+              desc: not allowed
+            - pkg: gopkg.in/yaml.v3$
+              desc: use go.yaml.in/yaml/v3
+    errcheck:
+      # path to a file containing a list of functions to exclude from checking
+      # see https://github.com/kisielk/errcheck#excluding-functions for details
+      exclude-functions:
+        - io/ioutil.WriteFile
+        - io/ioutil.ReadFile
+        - (github.com/go-kit/log.Logger).Log
+        - io.Copy
+        - (github.com/opentracing/opentracing-go.Tracer).Inject
+    forbidigo:
+      forbid:
+        - pattern: ^prometheus\.MustRegister$
+          pkg: ^github\.com/prometheus/client_golang/prometheus$
+          msg: use github.com/prometheus/client_golang/prometheus/promauto
+        - pattern: ^prometheus\.(NewCounter|NewCounterVec|NewGauge|NewGaugeVec|NewGaugeFunc|NewHistogram|NewHistogramVec|NewSummary|NewSummaryVec)$
+          pkg: ^github\.com/prometheus/client_golang/prometheus$
+          msg: use github.com/prometheus/client_golang/prometheus/promauto.With
+      analyze-types: true
+    revive:
+      rules:
+        - name: redefines-builtin-id
+          disabled: true
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/grafana/dskit

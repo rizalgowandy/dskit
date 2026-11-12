@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	consul "github.com/hashicorp/consul/api"
+	consul "github.com/hashicorp/consul/api/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -98,7 +98,7 @@ func TestReset(t *testing.T) {
 	const key = "test"
 	const max = 5
 
-	ch := make(chan error)
+	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
 		for i := 0; i <= max; i++ {
@@ -170,7 +170,7 @@ func TestWatchKeyWithNoStartValue(t *testing.T) {
 	defer fn()
 
 	reported := 0
-	c.WatchKey(ctx, key, func(i interface{}) bool {
+	c.WatchKey(ctx, key, func(interface{}) bool {
 		reported++
 		return reported != 2
 	})

@@ -1,3 +1,5 @@
+SHELL = /usr/bin/env bash
+
 # put tools at the root of the folder
 PATH := $(CURDIR)/.tools/bin:$(PATH)
 # We don't want find to scan inside a bunch of directories
@@ -6,16 +8,30 @@ DONT_FIND := -name vendor -prune -o -name .git -prune -o -name .cache -prune -o 
 PROTO_DEFS := $(shell find . $(DONT_FIND) -type f -name '*.proto' -print)
 PROTO_GOS := $(patsubst %.proto,%.pb.go,$(PROTO_DEFS))
 # Download the proper protoc version for Darwin (osx) and Linux.
-# If you need windows for some reason it's at https://github.com/protocolbuffers/protobuf/releases/download/v3.6.1/protoc-3.6.1-win32.zip
+# If you need windows for some reason it's at https://github.com/protocolbuffers/protobuf/releases/download/$(PROTO_VERSION)/protoc-$(PROTO_VERSION:v%=%)-win32.zip
 UNAME_S := $(shell uname -s)
-PROTO_PATH := https://github.com/protocolbuffers/protobuf/releases/download/v3.6.1/
+# renovate: datasource=github-release-attachments depName=protocolbuffers/protobuf
+PROTO_VERSION := v36.2
+# Pinned SHA256 hashes for the protoc archives. Maintained by Renovate via the
+# github-release-attachments datasource: the digestVersion= marker pins each
+# digest to its release tag, and Renovate identifies which release asset each
+# SHA fingerprints (linux-x86_64 vs osx-x86_64) by hashing the assets, so a
+# version bump rewrites the marker and both SHAs in lockstep.
+# renovate: datasource=github-release-attachments depName=protocolbuffers/protobuf digestVersion=v36.2
+PROTO_ZIP_SHA256_LINUX  := 121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278
+# renovate: datasource=github-release-attachments depName=protocolbuffers/protobuf digestVersion=v36.2
+PROTO_ZIP_SHA256_DARWIN := 228cc7add4616cc14ca5e80dee83209d44449a7aee95a914ae748fa374efb078
+PROTO_PATH := https://github.com/protocolbuffers/protobuf/releases/download/$(PROTO_VERSION)/
 ifeq ($(UNAME_S), Linux)
-	PROTO_ZIP=protoc-3.6.1-linux-x86_64.zip
+	PROTO_ZIP=protoc-$(PROTO_VERSION:v%=%)-linux-x86_64.zip
+	PROTO_ZIP_SHA256=$(PROTO_ZIP_SHA256_LINUX)
 endif
 ifeq ($(UNAME_S), Darwin)
-	PROTO_ZIP=protoc-3.6.1-osx-x86_64.zip
+	PROTO_ZIP=protoc-$(PROTO_VERSION:v%=%)-osx-x86_64.zip
+	PROTO_ZIP_SHA256=$(PROTO_ZIP_SHA256_DARWIN)
 endif
 GO_MODS=$(shell find . $(DONT_FIND) -type f -name 'go.mod' -print)
+SUBMODULE_GO_MODS=$(filter-out ./go.mod,$(GO_MODS))
 
 .DEFAULT_GOAL := help
 
@@ -31,22 +47,16 @@ test: ## Runs Go tests
 test-benchmarks: ## Runs Go benchmarks with 1 iteration to make sure they still make sense
 	go test -tags netgo -run=NONE -bench=. -benchtime=1x -timeout 30m ./...
 
+.PHONY: build-submodules
+build-submodules: ## Vets each nested module (separate go.mod) not covered by the root ./...
+	@./.scripts/build-submodules.sh $(SUBMODULE_GO_MODS)
+
 .PHONY: lint
-lint: .tools/bin/misspell .tools/bin/faillint .tools/bin/golangci-lint ## Runs misspell, golangci-lint, and faillint
+lint: .tools/bin/misspell .tools/bin/golangci-lint ## Runs misspell and golangci-lint
 	misspell -error README.md CONTRIBUTING.md LICENSE
 
 	# Configured via .golangci.yml.
 	golangci-lint run
-
-	# Ensure no blocklisted package is imported.
-	faillint -paths "github.com/bmizerany/assert=github.com/stretchr/testify/assert,\
-		golang.org/x/net/context=context,\
-		sync/atomic=go.uber.org/atomic,\
-		github.com/go-kit/kit/log, \
-		github.com/prometheus/client_golang/prometheus.{MustRegister}=github.com/prometheus/client_golang/prometheus/promauto,\
-		github.com/prometheus/client_golang/prometheus.{NewCounter,NewCounterVec,NewGauge,NewGaugeVec,NewGaugeFunc,NewHistogram,NewHistogramVec,NewSummary,NewSummaryVec}\
-		=github.com/prometheus/client_golang/prometheus/promauto.With.{NewCounter,NewCounterVec,NewGauge,NewGaugeVec,NewGaugeFunc,NewHistogram,NewHistogramVec,NewSummary,NewSummaryVec}"\
-		./...
 
 .PHONY: clean
 clean: ## Removes the .tools/ directory
@@ -78,16 +88,27 @@ check-protos: clean-protos protos ## Re-generates protos and git diffs them
 .tools/bin/misspell: .tools
 	GOPATH=$(CURDIR)/.tools go install github.com/client9/misspell/cmd/misspell@v0.3.4
 
-.tools/bin/faillint: .tools
-	GOPATH=$(CURDIR)/.tools go install github.com/fatih/faillint@v1.11.0
-
+GOLANGCI_LINT_VERSION := 2.15.0
 .tools/bin/golangci-lint: .tools
-	GOPATH=$(CURDIR)/.tools go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.53.2
+	@set -e; \
+	mkdir -p .tools/bin; \
+	OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	ARCH=$$(go env GOARCH); \
+	SLUG=golangci-lint-$(GOLANGCI_LINT_VERSION)-$$OS-$$ARCH; \
+	BASE=https://github.com/golangci/golangci-lint/releases/download/v$(GOLANGCI_LINT_VERSION); \
+	curl -sSfL "$$BASE/$$SLUG.tar.gz" -o ".tools/$$SLUG.tar.gz"; \
+	curl -sSfL "$$BASE/golangci-lint-$(GOLANGCI_LINT_VERSION)-checksums.txt" -o ".tools/golangci-lint-checksums.txt"; \
+	grep -E "[[:space:]]+$$SLUG\.tar\.gz$$" ".tools/golangci-lint-checksums.txt" > ".tools/$$SLUG.sha256"; \
+	(cd .tools && sha256sum --check --strict "$$SLUG.sha256"); \
+	tar -xzf ".tools/$$SLUG.tar.gz" -C .tools/bin --strip-components=1 "$$SLUG/golangci-lint"; \
+	rm ".tools/$$SLUG.tar.gz" ".tools/golangci-lint-checksums.txt" ".tools/$$SLUG.sha256"
 
 .tools/bin/protoc: .tools
 ifeq ("$(wildcard .tools/protoc/bin/protoc)","")
 	mkdir -p .tools/protoc
 	cd .tools/protoc && curl -LO $(PROTO_PATH)$(PROTO_ZIP)
+	# Verify the archive against the pinned SHA256 before unzip.
+	cd .tools/protoc && echo "$(PROTO_ZIP_SHA256)  $(PROTO_ZIP)" | sha256sum --check --strict -
 	unzip -n .tools/protoc/$(PROTO_ZIP) -d .tools/protoc/
 endif
 
@@ -96,14 +117,3 @@ endif
 
 .tools/bin/protoc-gen-go: .tools
 	GOPATH=$(CURDIR)/.tools go install github.com/golang/protobuf/protoc-gen-go@v1.3.1
-
-.PHONY: drone
-drone: .drone/drone.yml
-
-.drone/drone.yml: .drone/drone.jsonnet
-	# Drone's jsonnet formatting causes issues where arrays disappear
-	drone jsonnet --source $< --target $@.tmp --stream --format=false
-	drone sign --save grafana/dskit $@.tmp
-	drone lint --trusted $@.tmp
-	# When all passes move to correct destination
-	mv $@.tmp $@

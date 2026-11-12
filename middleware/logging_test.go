@@ -38,7 +38,7 @@ func TestBadWriteLogging(t *testing.T) {
 		loggingMiddleware := Log{
 			Log: logger,
 		}
-		handler := func(w http.ResponseWriter, r *http.Request) {
+		handler := func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, "<html><body>Hello World!</body></html>")
 		}
 		loggingHandler := loggingMiddleware.Wrap(http.HandlerFunc(handler))
@@ -80,7 +80,7 @@ func TestDisabledSuccessfulRequestsLogging(t *testing.T) {
 			DisableRequestSuccessLog: tc.disableLog,
 		}
 
-		handler := func(w http.ResponseWriter, r *http.Request) {
+		handler := func(w http.ResponseWriter, _ *http.Request) {
 			_, err := io.WriteString(w, "<html><body>Hello World!</body></html>")
 			require.NoError(t, err) //nolint:errcheck
 		}
@@ -122,7 +122,7 @@ func TestLoggingRequestsAtInfoLevel(t *testing.T) {
 			Log:                   log.NewGoKitWithWriter(log.LogfmtFormat, buf),
 			LogRequestAtInfoLevel: true,
 		}
-		handler := func(w http.ResponseWriter, r *http.Request) {
+		handler := func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, "<html><body>Hello World!</body></html>")
 		}
 		loggingHandler := loggingMiddleware.Wrap(http.HandlerFunc(handler))
@@ -143,38 +143,55 @@ func TestLoggingRequestsAtInfoLevel(t *testing.T) {
 }
 
 func TestLoggingRequestWithExcludedHeaders(t *testing.T) {
-	defaultHeaders := []string{"Authorization", "Cookie", "X-Csrf-Token"}
+	defaultHeaders := []string{"Authorization", "Cookie", "X-Csrf-Token", "X-Grafana-Id", "X-Access-Token"}
 	for _, tc := range []struct {
 		name              string
 		setHeaderList     []string
 		excludeHeaderList []string
 		mustNotContain    []string
+		statusCode        int
+		logRequestHeaders bool
 	}{
 		{
-			name:           "Default excluded headers are excluded",
-			setHeaderList:  defaultHeaders,
-			mustNotContain: defaultHeaders,
+			name:              "Default excluded headers are excluded",
+			setHeaderList:     defaultHeaders,
+			mustNotContain:    defaultHeaders,
+			statusCode:        http.StatusOK,
+			logRequestHeaders: true,
 		},
 		{
 			name:              "Extra configured header is also excluded",
 			setHeaderList:     append(defaultHeaders, "X-Secret-Header"),
 			excludeHeaderList: []string{"X-Secret-Header"},
 			mustNotContain:    append(defaultHeaders, "X-Secret-Header"),
+			statusCode:        http.StatusOK,
+			logRequestHeaders: true,
 		},
 		{
 			name:              "Multiple extra configured headers are also excluded",
 			setHeaderList:     append(defaultHeaders, "X-Secret-Header", "X-Secret-Header-2"),
 			excludeHeaderList: []string{"X-Secret-Header", "X-Secret-Header-2"},
 			mustNotContain:    append(defaultHeaders, "X-Secret-Header", "X-Secret-Header-2"),
+			statusCode:        http.StatusOK,
+			logRequestHeaders: true,
+		},
+		{
+			name:              "Log request headers disabled and status code 500",
+			setHeaderList:     append(defaultHeaders, "X-Secret-Header"),
+			excludeHeaderList: []string{},
+			mustNotContain:    append(defaultHeaders, "X-Secret-Header"),
+			statusCode:        http.StatusInternalServerError,
+			logRequestHeaders: false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := bytes.NewBuffer(nil)
 
-			loggingMiddleware := NewLogMiddleware(log.NewGoKitWithWriter(log.LogfmtFormat, buf), true, false, nil, tc.excludeHeaderList)
+			loggingMiddleware := NewLogMiddleware(log.NewGoKitWithWriter(log.LogfmtFormat, buf), tc.logRequestHeaders, false, nil, tc.excludeHeaderList)
 
-			handler := func(w http.ResponseWriter, r *http.Request) {
+			handler := func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = io.WriteString(w, "<html><body>Hello world!</body></html>")
+				w.WriteHeader(tc.statusCode)
 			}
 			loggingHandler := loggingMiddleware.Wrap(http.HandlerFunc(handler))
 
@@ -192,6 +209,27 @@ func TestLoggingRequestWithExcludedHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResponseBodyEscapingInLogs(t *testing.T) {
+	responseBody := `{"status":"error","errorType":"timeout","error":"rpc error: code = DeadlineExceeded desc = context deadline exceeded"}` + "\n"
+	buf := bytes.NewBuffer(nil)
+	loggingMiddleware := Log{
+		Log: log.NewGoKitWithWriter(log.LogfmtFormat, buf),
+	}
+	handler := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = io.WriteString(w, responseBody)
+	}
+	loggingHandler := loggingMiddleware.Wrap(http.HandlerFunc(handler))
+
+	req := httptest.NewRequest("POST", "/loki/api/v1/push", nil)
+	loggingHandler.ServeHTTP(httptest.NewRecorder(), req)
+
+	output := buf.String()
+	require.Contains(t, output, "level=warn")
+	require.Contains(t, output, "POST /loki/api/v1/push (504)")
+	require.Contains(t, output, `Response: {\"status\":\"error\",\"errorType\":\"timeout\",\"error\":\"rpc error: code = DeadlineExceeded desc = context deadline exceeded\"}\n`)
 }
 
 type errorWriter struct {

@@ -2,6 +2,7 @@ package ring
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/go-kit/log"
@@ -19,6 +20,7 @@ var (
 	ErrPartitionDoesNotExist          = errors.New("the partition does not exist")
 	ErrPartitionStateMismatch         = errors.New("the partition state does not match the expected one")
 	ErrPartitionStateChangeNotAllowed = errors.New("partition state change not allowed")
+	ErrPartitionStateChangeLocked     = errors.New("partition state change is locked")
 
 	allowedPartitionStateChanges = map[PartitionState][]PartitionState{
 		PartitionPending:  {PartitionActive, PartitionInactive},
@@ -28,11 +30,22 @@ var (
 )
 
 type PartitionInstanceLifecyclerConfig struct {
-	// PartitionID is the ID of the partition managed by the lifecycler.
+	// PartitionID is the ID of the partition managed by the lifecycler. It must not be negative.
 	PartitionID int32
+
+	// CreatePartitionsWithDerivedTokens creates new partitions using PartitionTokensSmt512, without stored tokens.
+	// When enabled, PartitionID must be below MaxDerivedTokenPartitions.
+	// An existing partition keeps its token scheme.
+	CreatePartitionsWithDerivedTokens bool
+
+	// MaxDerivedTokenPartitions is the number of partition IDs, from 0, that can be created with derived tokens.
+	MaxDerivedTokenPartitions int32
 
 	// InstanceID is the ID of the instance managed by the lifecycler.
 	InstanceID string
+	// MultiPartitionOwnership is the flag that indicates whether the lifecycler should allow owning multiple partitions.
+	// This changes the InstanceID used to register the owner in the ring.
+	MultiPartitionOwnership bool
 
 	// WaitOwnersCountOnPending is the minimum number of owners to wait before switching a
 	// PENDING partition to ACTIVE.
@@ -78,7 +91,15 @@ type PartitionInstanceLifecycler struct {
 	reconcilesFailedTotal *prometheus.CounterVec
 }
 
-func NewPartitionInstanceLifecycler(cfg PartitionInstanceLifecyclerConfig, ringName, ringKey string, store kv.Client, logger log.Logger, reg prometheus.Registerer) *PartitionInstanceLifecycler {
+func NewPartitionInstanceLifecycler(cfg PartitionInstanceLifecyclerConfig, ringName, ringKey string, store kv.Client, logger log.Logger, reg prometheus.Registerer) (*PartitionInstanceLifecycler, error) {
+	if cfg.PartitionID < 0 {
+		return nil, fmt.Errorf("invalid partition ID %d: must not be negative", cfg.PartitionID)
+	}
+
+	if cfg.CreatePartitionsWithDerivedTokens && cfg.PartitionID >= cfg.MaxDerivedTokenPartitions {
+		return nil, fmt.Errorf("invalid partition ID %d: must be below the maximum derived token partitions (%d) when creating partitions with derived tokens", cfg.PartitionID, cfg.MaxDerivedTokenPartitions)
+	}
+
 	if cfg.PollingInterval == 0 {
 		cfg.PollingInterval = 5 * time.Second
 	}
@@ -106,7 +127,7 @@ func NewPartitionInstanceLifecycler(cfg PartitionInstanceLifecyclerConfig, ringN
 
 	l.BasicService = services.NewBasicService(l.starting, l.running, l.stopping)
 
-	return l
+	return l, nil
 }
 
 // CreatePartitionOnStartup returns whether the lifecycle creates the partition on startup
@@ -205,13 +226,13 @@ func (l *PartitionInstanceLifecycler) stopping(_ error) error {
 	// Remove the instance from partition owners, if configured to do so.
 	if l.RemoveOwnerOnShutdown() {
 		err := l.updateRing(context.Background(), func(ring *PartitionRingDesc) (bool, error) {
-			return ring.RemoveOwner(l.cfg.InstanceID), nil
+			return ring.RemoveOwner(l.partitionOwnerID()), nil
 		})
 
 		if err != nil {
-			level.Error(l.logger).Log("msg", "failed to remove instance from partition owners on shutdown", "instance", l.cfg.InstanceID, "partition", l.cfg.PartitionID, "err", err)
+			level.Error(l.logger).Log("msg", "failed to remove instance from partition owners on shutdown", "instance", l.cfg.InstanceID, "partition_owner_id", l.partitionOwnerID(), "partition", l.cfg.PartitionID, "err", err)
 		} else {
-			level.Info(l.logger).Log("msg", "instance removed from partition owners", "instance", l.cfg.InstanceID, "partition", l.cfg.PartitionID)
+			level.Info(l.logger).Log("msg", "instance removed from partition owners", "instance", l.cfg.InstanceID, "partition_owner_id", l.partitionOwnerID(), "partition", l.cfg.PartitionID)
 		}
 	}
 
@@ -261,6 +282,15 @@ func (l *PartitionInstanceLifecycler) updateRing(ctx context.Context, update fun
 	})
 }
 
+// partitionOwnerID returns the instance ID used to register the owner in the ring.
+func (l *PartitionInstanceLifecycler) partitionOwnerID() string {
+	if l.cfg.MultiPartitionOwnership {
+		return multiPartitionOwnerInstanceID(l.cfg.InstanceID, l.cfg.PartitionID)
+	}
+
+	return l.cfg.InstanceID
+}
+
 func (l *PartitionInstanceLifecycler) createPartitionAndRegisterOwner(ctx context.Context) error {
 	return l.updateRing(ctx, func(ring *PartitionRingDesc) (bool, error) {
 		now := time.Now()
@@ -268,7 +298,7 @@ func (l *PartitionInstanceLifecycler) createPartitionAndRegisterOwner(ctx contex
 
 		partitionDesc, exists := ring.Partitions[l.cfg.PartitionID]
 		if exists {
-			level.Info(l.logger).Log("msg", "partition found in the ring", "partition", l.cfg.PartitionID, "state", partitionDesc.GetState(), "state_timestamp", partitionDesc.GetState().String(), "tokens", len(partitionDesc.GetTokens()))
+			level.Info(l.logger).Log("msg", "partition found in the ring", "partition", l.cfg.PartitionID, "state", partitionDesc.GetState(), "state_timestamp", partitionDesc.GetState().String(), "tokens", len(partitionDesc.GetTokens()), "token_scheme", partitionDesc.GetTokenScheme())
 		} else {
 			level.Info(l.logger).Log("msg", "partition not found in the ring", "partition", l.cfg.PartitionID)
 		}
@@ -276,12 +306,16 @@ func (l *PartitionInstanceLifecycler) createPartitionAndRegisterOwner(ctx contex
 		if !exists {
 			// The partition doesn't exist, so we create a new one. A new partition should always be created
 			// in PENDING state.
-			ring.AddPartition(l.cfg.PartitionID, PartitionPending, now)
+			if l.cfg.CreatePartitionsWithDerivedTokens {
+				ring.AddPartitionWithDerivedTokens(l.cfg.PartitionID, PartitionPending, now)
+			} else {
+				ring.AddPartition(l.cfg.PartitionID, PartitionPending, now)
+			}
 			changed = true
 		}
 
 		// Ensure the instance is added as partition owner.
-		if ring.AddOrUpdateOwner(l.cfg.InstanceID, OwnerActive, l.cfg.PartitionID, now) {
+		if ring.AddOrUpdateOwner(l.partitionOwnerID(), OwnerActive, l.cfg.PartitionID, now) {
 			changed = true
 		}
 
@@ -329,7 +363,7 @@ func (l *PartitionInstanceLifecycler) waitPartitionAndRegisterOwner(ctx context.
 
 	// Ensure the instance is added as partition owner.
 	return l.updateRing(ctx, func(ring *PartitionRingDesc) (bool, error) {
-		return ring.AddOrUpdateOwner(l.cfg.InstanceID, OwnerActive, l.cfg.PartitionID, time.Now()), nil
+		return ring.AddOrUpdateOwner(l.partitionOwnerID(), OwnerActive, l.cfg.PartitionID, time.Now()), nil
 	})
 }
 
@@ -351,7 +385,7 @@ func (l *PartitionInstanceLifecycler) reconcileOwnedPartition(ctx context.Contex
 		// have been added since more than the waiting period.
 		if partition.IsPending() && ring.PartitionOwnersCountUpdatedBefore(partitionID, now.Add(-l.cfg.WaitOwnersDurationOnPending)) >= l.cfg.WaitOwnersCountOnPending {
 			level.Info(l.logger).Log("msg", "switching partition state because enough owners have been registered and minimum waiting time has elapsed", "partition", l.cfg.PartitionID, "from_state", PartitionPending, "to_state", PartitionActive)
-			return ring.UpdatePartitionState(partitionID, PartitionActive, now), nil
+			return ring.UpdatePartitionState(partitionID, PartitionActive, now)
 		}
 
 		return false, nil

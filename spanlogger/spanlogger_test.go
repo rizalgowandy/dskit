@@ -1,165 +1,25 @@
 package spanlogger
 
 import (
+	"bytes"
 	"context"
-	"strings"
 	"testing"
+
+	dskit_log "github.com/grafana/dskit/log"
+	"github.com/grafana/dskit/tenant"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/mocktracer"
-	"github.com/pkg/errors"
-	"github.com/stretchr/testify/require"
-
-	"github.com/grafana/dskit/user"
 )
-
-func TestSpanLogger_Log(t *testing.T) {
-	logger := log.NewNopLogger()
-	resolver := fakeResolver{}
-	span, ctx := New(context.Background(), logger, "test", resolver, "bar")
-	_ = span.Log("foo")
-	newSpan := FromContext(ctx, logger, resolver)
-	require.Equal(t, span.Span, newSpan.Span)
-	_ = newSpan.Log("bar")
-	noSpan := FromContext(context.Background(), logger, resolver)
-	_ = noSpan.Log("foo")
-	require.Error(t, noSpan.Error(errors.New("err")))
-	require.NoError(t, noSpan.Error(nil))
-}
-
-func TestSpanLogger_CustomLogger(t *testing.T) {
-	var logged [][]interface{}
-	var logger funcLogger = func(keyvals ...interface{}) error {
-		logged = append(logged, keyvals)
-		return nil
-	}
-	resolver := fakeResolver{}
-	span, ctx := New(context.Background(), logger, "test", resolver)
-	_ = span.Log("msg", "original spanlogger")
-
-	span = FromContext(ctx, log.NewNopLogger(), resolver)
-	_ = span.Log("msg", "restored spanlogger")
-
-	span = FromContext(context.Background(), logger, resolver)
-	_ = span.Log("msg", "fallback spanlogger")
-
-	expect := [][]interface{}{
-		{"method", "test", "msg", "original spanlogger"},
-		{"msg", "restored spanlogger"},
-		{"msg", "fallback spanlogger"},
-	}
-	require.Equal(t, expect, logged)
-}
-
-func TestSpanCreatedWithTenantTag(t *testing.T) {
-	mockSpan := createSpan(user.InjectOrgID(context.Background(), "team-a"))
-
-	require.Equal(t, []string{"team-a"}, mockSpan.Tag(TenantIDsTagName))
-}
-
-func TestSpanCreatedWithoutTenantTag(t *testing.T) {
-	mockSpan := createSpan(context.Background())
-
-	_, exists := mockSpan.Tags()[TenantIDsTagName]
-	require.False(t, exists)
-}
-
-func TestSpanLogger_SetSpanAndLogTag(t *testing.T) {
-	mockTracer := mocktracer.New()
-	opentracing.SetGlobalTracer(mockTracer)
-
-	logMessages := [][]interface{}{}
-	var logger funcLogger = func(keyvals ...interface{}) error {
-		logMessages = append(logMessages, keyvals)
-		return nil
-	}
-
-	spanLogger, _ := New(context.Background(), logger, "the_method", fakeResolver{})
-	require.NoError(t, spanLogger.Log("msg", "this is the first message"))
-
-	spanLogger.SetSpanAndLogTag("id", "123")
-	require.NoError(t, spanLogger.Log("msg", "this is the second message"))
-
-	spanLogger.SetSpanAndLogTag("more context", "abc")
-	require.NoError(t, spanLogger.Log("msg", "this is the third message"))
-
-	span := spanLogger.Span.(*mocktracer.MockSpan)
-	expectedTags := map[string]interface{}{
-		"id":           "123",
-		"more context": "abc",
-	}
-	require.Equal(t, expectedTags, span.Tags())
-
-	expectedLogMessages := [][]interface{}{
-		{
-			"method", "the_method",
-			"msg", "this is the first message",
-		},
-		{
-			"method", "the_method",
-			"id", "123",
-			"msg", "this is the second message",
-		},
-		{
-			"method", "the_method",
-			"id", "123",
-			"more context", "abc",
-			"msg", "this is the third message",
-		},
-	}
-
-	require.Equal(t, expectedLogMessages, logMessages)
-}
-
-func createSpan(ctx context.Context) *mocktracer.MockSpan {
-	mockTracer := mocktracer.New()
-	opentracing.SetGlobalTracer(mockTracer)
-
-	logger, _ := New(ctx, log.NewNopLogger(), "name", fakeResolver{})
-	return logger.Span.(*mocktracer.MockSpan)
-}
 
 type funcLogger func(keyvals ...interface{}) error
 
-func (f funcLogger) Log(keyvals ...interface{}) error {
-	return f(keyvals...)
-}
-
-type fakeResolver struct {
-}
-
-func (fakeResolver) TenantID(ctx context.Context) (string, error) {
-	id, err := user.ExtractOrgID(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	// handle the relative reference to current and parent path.
-	if id == "." || id == ".." || strings.ContainsAny(id, `\/`) {
-		return "", nil
-	}
-
-	return id, nil
-}
-
-func (r fakeResolver) TenantIDs(ctx context.Context) ([]string, error) {
-	id, err := r.TenantID(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if id == "" {
-		return nil, nil
-	}
-
-	return []string{id}, nil
-}
+func (f funcLogger) Log(keyvals ...interface{}) error { return f(keyvals...) }
 
 // Using a no-op logger and no tracing provider, measure the overhead of a small log call.
 func BenchmarkSpanLogger(b *testing.B) {
 	logger := noDebugNoopLogger{}
-	resolver := fakeResolver{}
+	resolver := tenant.NewMultiResolver()
 	sl, _ := New(context.Background(), logger, "test", resolver, "bar")
 	b.Run("log", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
@@ -178,8 +38,97 @@ func BenchmarkSpanLogger(b *testing.B) {
 	})
 }
 
+func BenchmarkSpanLoggerWithRealLogger(b *testing.B) {
+	testCases := map[string]bool{
+		"all levels allowed":     true,
+		"info and above allowed": false,
+	}
+
+	for name, debugEnabled := range testCases {
+		b.Run(name, func(b *testing.B) {
+			buf := bytes.NewBuffer(nil)
+			logger := dskit_log.NewGoKitWithWriter("logfmt", buf)
+			logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", Caller(5))
+
+			if debugEnabled {
+				logger = level.NewFilter(logger, level.AllowAll())
+			} else {
+				logger = level.NewFilter(logger, level.AllowInfo())
+			}
+
+			logger = loggerWithDebugEnabled{
+				Logger:       logger,
+				debugEnabled: debugEnabled,
+			}
+
+			resolver := tenant.NewMultiResolver()
+			sl, _ := New(context.Background(), logger, "test", resolver, "bar")
+
+			b.Run("Log", func(b *testing.B) {
+				buf.Reset()
+				b.ResetTimer()
+
+				for i := 0; i < b.N; i++ {
+					_ = sl.Log("msg", "foo", "more", "data")
+				}
+			})
+
+			b.Run("level.Debug", func(b *testing.B) {
+				buf.Reset()
+				b.ResetTimer()
+
+				for i := 0; i < b.N; i++ {
+					_ = level.Debug(sl).Log("msg", "foo", "more", "data")
+				}
+			})
+
+			b.Run("DebugLog", func(b *testing.B) {
+				buf.Reset()
+				b.ResetTimer()
+
+				for i := 0; i < b.N; i++ {
+					sl.DebugLog("msg", "foo", "more", "data")
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkSpanLoggerAwareCaller(b *testing.B) {
+	runBenchmark := func(b *testing.B, caller log.Valuer) {
+		buf := bytes.NewBuffer(nil)
+		logger := dskit_log.NewGoKitWithWriter("logfmt", buf)
+		logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", caller)
+
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			_ = logger.Log("msg", "foo", "more", "data")
+		}
+
+	}
+
+	const defaultStackDepth = 5
+
+	b.Run("with go-kit's Caller", func(b *testing.B) {
+		runBenchmark(b, log.Caller(defaultStackDepth))
+	})
+
+	b.Run("with dskit's spanlogger.Caller", func(b *testing.B) {
+		runBenchmark(b, Caller(defaultStackDepth))
+	})
+}
+
 // Logger which does nothing and implements the DebugEnabled interface used by SpanLogger.
 type noDebugNoopLogger struct{}
 
 func (noDebugNoopLogger) Log(...interface{}) error { return nil }
 func (noDebugNoopLogger) DebugEnabled() bool       { return false }
+
+// Logger which delegates to the inner log.Logger, and implements the DebugEnabled interface used by SpanLogger.
+type loggerWithDebugEnabled struct {
+	log.Logger
+	debugEnabled bool
+}
+
+func (l loggerWithDebugEnabled) DebugEnabled() bool { return l.debugEnabled }

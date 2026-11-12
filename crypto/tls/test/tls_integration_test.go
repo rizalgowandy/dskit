@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gogo/status"
+	"github.com/hashicorp/go-cleanhttp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,6 +32,12 @@ import (
 
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/crypto/tls"
+)
+
+const (
+	mismatchCAAndCerts         = "remote error: tls: unknown certificate authority"
+	badCertificateErrorMessage = "remote error: tls: certificate required"
+	tcpNetwork                 = "tcp"
 )
 
 type tcIntegrationClientServer struct {
@@ -52,17 +60,23 @@ func (h *grpcHealthCheck) Check(_ context.Context, _ *grpc_health_v1.HealthCheck
 	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
 }
 
+func (h *grpcHealthCheck) List(ctx context.Context, _ *grpc_health_v1.HealthListRequest) (*grpc_health_v1.HealthListResponse, error) {
+	statuses := make(map[string]*grpc_health_v1.HealthCheckResponse)
+	statuses["server"], _ = h.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
+	return &grpc_health_v1.HealthListResponse{Statuses: statuses}, nil
+}
+
 func (h *grpcHealthCheck) Watch(_ *grpc_health_v1.HealthCheckRequest, _ grpc_health_v1.Health_WatchServer) error {
 	return status.Error(codes.Unimplemented, "Watching is not supported")
 }
 
 func getLocalHostAddr() (*net.TCPAddr, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	addr, err := net.ResolveTCPAddr(tcpNetwork, "[::]:0")
 	if err != nil {
 		return nil, err
 	}
 
-	l, err := net.ListenTCP("tcp", addr)
+	l, err := net.ListenTCP(tcpNetwork, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +115,9 @@ func newIntegrationClientServer(
 
 	serv, err := server.New(cfg)
 	require.NoError(t, err)
+	defer serv.Shutdown()
 
-	serv.HTTP.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+	serv.HTTP.HandleFunc("/hello", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "OK")
 	})
 
@@ -117,15 +132,38 @@ func newIntegrationClientServer(
 	grpcHost := net.JoinHostPort("localhost", strconv.Itoa(grpcAddr.Port))
 
 	for _, tc := range tcs {
-		tlsClientConfig, err := tc.tlsConfig.GetTLSConfig()
-		require.NoError(t, err)
-
 		// HTTP
 		t.Run("HTTP/"+tc.name, func(t *testing.T) {
-			transport := &http.Transport{TLSClientConfig: tlsClientConfig}
+			tlsClientConfig, err := tc.tlsConfig.GetTLSConfig()
+			require.NoError(t, err)
+
+			transport := cleanhttp.DefaultTransport()
+			transport.TLSClientConfig = tlsClientConfig
 			client := &http.Client{Transport: transport}
 
-			resp, err := client.Get(httpURL)
+			cancellableCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(cancellableCtx, http.MethodGet, httpURL, nil)
+			require.NoError(t, err)
+
+			resp, err := client.Do(req)
+			// We retry the request a few times in case of a TCP reset (and we're expecting an error)
+			// Sometimes, the server resets the connection rather than sending the TLS error
+			// Seems that even Google have issues with RST flakiness: https://go-review.googlesource.com/c/go/+/527196
+			isRST := func(err error) bool {
+				if err == nil {
+					return false
+				}
+				return strings.Contains(err.Error(), "connection reset by peer") ||
+					strings.Contains(err.Error(), "broken pipe") ||
+					strings.Contains(err.Error(), "client conn could not be established")
+			}
+			for i := 0; i < 10 && isRST(err) && tc.httpExpectError != nil; i++ {
+				t.Logf("Sleeping before retry #%d, due to RST error: %s", i+1, err)
+				time.Sleep(100 * time.Millisecond)
+				resp, err = client.Do(req)
+			}
 			if err == nil {
 				defer resp.Body.Close()
 			}
@@ -140,7 +178,7 @@ func newIntegrationClientServer(
 			body, err := io.ReadAll(resp.Body)
 			assert.NoError(t, err, tc.name)
 
-			assert.Equal(t, []byte("OK"), body, tc.name)
+			assert.Equal(t, []byte("OK"), body, tc.name, string(body))
 		})
 
 		// GRPC
@@ -155,17 +193,19 @@ func newIntegrationClientServer(
 			assert.NoError(t, err, tc.name)
 			dialOptions = append([]grpc.DialOption{grpc.WithDefaultCallOptions(clientConfig.CallOptions()...)}, dialOptions...)
 
-			conn, err := grpc.Dial(grpcHost, dialOptions...)
-			assert.NoError(t, err, tc.name)
+			conn, err := grpc.NewClient(grpcHost, dialOptions...)
 			require.NoError(t, err, tc.name)
-			require.NoError(t, err, tc.name)
+			defer conn.Close()
+
+			cancellableCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
 			client := grpc_health_v1.NewHealthClient(conn)
 
 			// TODO: Investigate why the client doesn't really receive the
 			// error about the bad certificate from the server side and just
 			// see connection closed instead
-			resp, err := client.Check(context.TODO(), &grpc_health_v1.HealthCheckRequest{})
+			resp, err := client.Check(cancellableCtx, &grpc_health_v1.HealthCheckRequest{})
 			if tc.grpcExpectError != nil {
 				tc.grpcExpectError(t, err)
 				return
@@ -175,10 +215,7 @@ func newIntegrationClientServer(
 				assert.Equal(t, grpc_health_v1.HealthCheckResponse_SERVING, resp.Status)
 			}
 		})
-
 	}
-
-	serv.Shutdown()
 }
 
 func TestServerWithoutTlsEnabled(t *testing.T) {
@@ -363,6 +400,8 @@ func TestTLSServerWithLocalhostCertWithClientCertificateEnforcementUsingClientCA
 	// bad certificate from the server side and just see connection
 	// closed/reset instead
 	badCertErr := errorContainsString(badCertificateErrorMessage)
+	mismatchCAAndCertsErr := errorContainsString(mismatchCAAndCerts)
+
 	newIntegrationClientServer(
 		t,
 		cfg,
@@ -411,7 +450,7 @@ func TestTLSServerWithLocalhostCertWithClientCertificateEnforcementUsingClientCA
 					CertPath: certs.client2CertFile,
 					KeyPath:  certs.client2KeyFile,
 				},
-				httpExpectError: badCertErr,
+				httpExpectError: mismatchCAAndCertsErr,
 				grpcExpectError: unavailableDescErr,
 			},
 		},
@@ -524,7 +563,6 @@ func setupCertificates(t *testing.T) keyMaterial {
 		require.NoError(t, err)
 		_, err = io.Copy(dst, src2)
 		require.NoError(t, err)
-
 	}()
 
 	client1CertFile := filepath.Join(testCADir, "client-1.crt")

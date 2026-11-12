@@ -184,6 +184,126 @@ func BenchmarkGetMetricsWithLabelNames(b *testing.B) {
 	}
 }
 
+// TestSendSumOfGaugesPerTenant tests to ensure multiple metrics for the same tenant with a matching label are
+// summed correctly.
+func TestSendSumOfGaugesPerTenant(t *testing.T) {
+	user1Reg := prometheus.NewRegistry()
+	user2Reg := prometheus.NewRegistry()
+	user3Reg := prometheus.NewRegistry()
+	user1Metric := promauto.With(user1Reg).NewGaugeVec(prometheus.GaugeOpts{Name: "test_metric"}, []string{"label_one", "label_two"})
+	user2Metric := promauto.With(user2Reg).NewGaugeVec(prometheus.GaugeOpts{Name: "test_metric"}, []string{"label_one", "label_two"})
+	user3Metric := promauto.With(user3Reg).NewGaugeVec(prometheus.GaugeOpts{Name: "test_metric"}, []string{"label_one", "label_two"})
+	user1Metric.WithLabelValues("a", "b").Set(100)
+	user1Metric.WithLabelValues("a", "c").Set(80)
+	user1Metric.WithLabelValues("b", "c").Set(0)
+	user2Metric.WithLabelValues("a", "b").Set(60)
+	user2Metric.WithLabelValues("a", "c").Set(40)
+	user2Metric.WithLabelValues("b", "c").Set(0)
+	user3Metric.WithLabelValues("a", "b").Set(0)
+	user3Metric.WithLabelValues("a", "c").Set(0)
+	user3Metric.WithLabelValues("b", "c").Set(20)
+
+	regs := NewTenantRegistries(log.NewNopLogger())
+	regs.AddTenantRegistry("user-1", user1Reg)
+	regs.AddTenantRegistry("user-2", user2Reg)
+	regs.AddTenantRegistry("user-3", user3Reg)
+	mf := regs.BuildMetricFamiliesPerTenant()
+
+	t.Run("group metrics by user and label_one", func(t *testing.T) {
+		desc := prometheus.NewDesc("test_metric", "", []string{"user", "label_one"}, nil)
+		actual := collectMetrics(t, func(out chan prometheus.Metric) {
+			mf.SendSumOfGaugesPerTenant(out, desc, "test_metric", WithLabels("label_one"))
+		})
+		expected := []*dto.Metric{
+			{Label: makeLabels("label_one", "a", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(180)}},
+			{Label: makeLabels("label_one", "b", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "a", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(100)}},
+			{Label: makeLabels("label_one", "b", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "a", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "b", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(20)}},
+		}
+		require.ElementsMatch(t, expected, actual)
+	})
+
+	t.Run("group metrics by user and label_one, and skip zero value metrics", func(t *testing.T) {
+		desc := prometheus.NewDesc("test_metric", "", []string{"user", "label_one"}, nil)
+		actual := collectMetrics(t, func(out chan prometheus.Metric) {
+			mf.SendSumOfGaugesPerTenant(out, desc, "test_metric", WithLabels("label_one"), WithSkipZeroValueMetrics)
+		})
+		expected := []*dto.Metric{
+			{Label: makeLabels("label_one", "a", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(180)}},
+			{Label: makeLabels("label_one", "a", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(100)}},
+			{Label: makeLabels("label_one", "b", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(20)}},
+		}
+		require.ElementsMatch(t, expected, actual)
+	})
+
+	t.Run("group metrics by user and label_two", func(t *testing.T) {
+		desc := prometheus.NewDesc("test_metric", "", []string{"user", "label_two"}, nil)
+		actual := collectMetrics(t, func(out chan prometheus.Metric) {
+			mf.SendSumOfGaugesPerTenant(out, desc, "test_metric", WithLabels("label_two"))
+		})
+		expected := []*dto.Metric{
+			{Label: makeLabels("label_two", "b", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(100)}},
+			{Label: makeLabels("label_two", "c", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(80)}},
+			{Label: makeLabels("label_two", "b", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(60)}},
+			{Label: makeLabels("label_two", "c", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(40)}},
+			{Label: makeLabels("label_two", "b", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_two", "c", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(20)}},
+		}
+		require.ElementsMatch(t, expected, actual)
+	})
+
+	t.Run("group metrics by user and label_two, and skip zero value metrics", func(t *testing.T) {
+		desc := prometheus.NewDesc("test_metric", "", []string{"user", "label_two"}, nil)
+		actual := collectMetrics(t, func(out chan prometheus.Metric) {
+			mf.SendSumOfGaugesPerTenant(out, desc, "test_metric", WithLabels("label_two"), WithSkipZeroValueMetrics)
+		})
+		expected := []*dto.Metric{
+			{Label: makeLabels("label_two", "b", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(100)}},
+			{Label: makeLabels("label_two", "c", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(80)}},
+			{Label: makeLabels("label_two", "b", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(60)}},
+			{Label: makeLabels("label_two", "c", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(40)}},
+			{Label: makeLabels("label_two", "c", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(20)}},
+		}
+		require.ElementsMatch(t, expected, actual)
+	})
+
+	t.Run("group metrics by user, label_one and label_two", func(t *testing.T) {
+		desc := prometheus.NewDesc("test_metric", "", []string{"user", "label_one", "label_two"}, nil)
+		actual := collectMetrics(t, func(out chan prometheus.Metric) {
+			mf.SendSumOfGaugesPerTenant(out, desc, "test_metric", WithLabels("label_one", "label_two"))
+		})
+		expected := []*dto.Metric{
+			{Label: makeLabels("label_one", "a", "label_two", "b", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(100)}},
+			{Label: makeLabels("label_one", "a", "label_two", "c", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(80)}},
+			{Label: makeLabels("label_one", "b", "label_two", "c", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "a", "label_two", "b", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(60)}},
+			{Label: makeLabels("label_one", "a", "label_two", "c", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(40)}},
+			{Label: makeLabels("label_one", "b", "label_two", "c", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "a", "label_two", "b", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "a", "label_two", "c", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(0)}},
+			{Label: makeLabels("label_one", "b", "label_two", "c", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(20)}},
+		}
+		require.ElementsMatch(t, expected, actual)
+	})
+
+	t.Run("group metrics by user, label_one and label_two, and skip zero value metrics", func(t *testing.T) {
+		desc := prometheus.NewDesc("test_metric", "", []string{"user", "label_one", "label_two"}, nil)
+		actual := collectMetrics(t, func(out chan prometheus.Metric) {
+			mf.SendSumOfGaugesPerTenant(out, desc, "test_metric", WithLabels("label_one", "label_two"), WithSkipZeroValueMetrics)
+		})
+		expected := []*dto.Metric{
+			{Label: makeLabels("label_one", "a", "label_two", "b", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(100)}},
+			{Label: makeLabels("label_one", "a", "label_two", "c", "user", "user-1"), Gauge: &dto.Gauge{Value: proto.Float64(80)}},
+			{Label: makeLabels("label_one", "a", "label_two", "b", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(60)}},
+			{Label: makeLabels("label_one", "a", "label_two", "c", "user", "user-2"), Gauge: &dto.Gauge{Value: proto.Float64(40)}},
+			{Label: makeLabels("label_one", "b", "label_two", "c", "user", "user-3"), Gauge: &dto.Gauge{Value: proto.Float64(20)}},
+		}
+		require.ElementsMatch(t, expected, actual)
+	})
+}
+
 // TestSendSumOfGaugesPerTenantWithLabels tests to ensure multiple metrics for the same tenant with a matching label are
 // summed correctly.
 func TestSendSumOfGaugesPerTenantWithLabels(t *testing.T) {
@@ -1225,4 +1345,161 @@ func float64p(v float64) *float64 {
 
 func uint64p(v uint64) *uint64 {
 	return &v
+}
+
+// TestSoftRemoveTenantRegistryDeduplication verifies that metrics are deduplicated
+// when the same tenant is cycled multiple times (memory leak fix).
+func TestSoftRemoveTenantRegistryDeduplication(t *testing.T) {
+	tr := NewTenantRegistries(log.NewNopLogger())
+
+	// Cycle through the same 10 tenants twice to verify:
+	// 1. Deduplication prevents memory leak (only 10 metrics, not 20).
+	// 2. Values accumulate correctly (counter = 2 after two cycles, not 1).
+	for cycle := range 2 {
+		for i := range 10 {
+			r := prometheus.NewRegistry()
+			counter := promauto.With(r).NewCounterVec(prometheus.CounterOpts{
+				Name: "test_counter",
+				Help: "Test counter help",
+			}, []string{"user"})
+			gauge := promauto.With(r).NewGaugeVec(prometheus.GaugeOpts{
+				Name: "test_gauge",
+				Help: "Test gauge help",
+			}, []string{"user"})
+			summary := promauto.With(r).NewSummaryVec(prometheus.SummaryOpts{
+				Name: "test_summary",
+				Help: "Test help",
+			}, []string{"user"})
+			histogram := promauto.With(r).NewHistogramVec(prometheus.HistogramOpts{
+				Name: "test_histogram",
+				Help: "Test help",
+			}, []string{"user"})
+
+			user := fmt.Sprintf("test-%d", i)
+			tr.AddTenantRegistry(user, r)
+			counter.WithLabelValues(user).Add(1)
+			gauge.WithLabelValues(user).Add(1)
+			summary.WithLabelValues(user).Observe(1)
+			histogram.WithLabelValues(user).Observe(1)
+		}
+
+		require.Equal(t, 10, len(tr.Registries()), "Cycle %d: Expected 10 active registries", cycle)
+
+		for i := 0; i < 10; i++ {
+			tr.RemoveTenantRegistry(fmt.Sprintf("test-%d", i), false)
+		}
+
+		require.Equal(t, 0, len(tr.Registries()), "Cycle %d: Expected 0 active registries after removal", cycle)
+
+		// Gauges should never be archived (only counters, histograms, summaries).
+		_, exists := tr.archived["test_gauge"]
+		require.False(t, exists, "Cycle %d: Gauges should not be archived", cycle)
+
+		// After first cycle: verify initial archival works.
+		// After second cycle: verify deduplication and accumulation.
+		expectedCount := cycle + 1
+
+		counterMetrics := tr.archived["test_counter"]
+		require.Equal(t, 10, len(counterMetrics.Metric), "Cycle %d: Expected 10 archived counter metrics", cycle)
+		for _, m := range counterMetrics.Metric {
+			require.Equal(t, float64(expectedCount), m.GetCounter().GetValue(), "Cycle %d: Expected counter value %d for user %v", cycle, expectedCount, m.GetLabel())
+		}
+
+		histogramMetrics := tr.archived["test_histogram"]
+		require.Equal(t, 10, len(histogramMetrics.Metric), "Cycle %d: Expected 10 archived histogram metrics", cycle)
+		for _, m := range histogramMetrics.Metric {
+			require.Equal(t, uint64(expectedCount), m.GetHistogram().GetSampleCount(), "Cycle %d: Expected histogram sample_count %d", cycle, expectedCount)
+			require.Equal(t, float64(expectedCount), m.GetHistogram().GetSampleSum(), "Cycle %d: Expected histogram sample_sum %d", cycle, expectedCount)
+		}
+
+		summaryMetrics := tr.archived["test_summary"]
+		require.Equal(t, 10, len(summaryMetrics.Metric), "Cycle %d: Expected 10 archived summary metrics", cycle)
+		for _, m := range summaryMetrics.Metric {
+			require.Equal(t, uint64(expectedCount), m.GetSummary().GetSampleCount(), "Cycle %d: Expected summary sample_count %d", cycle, expectedCount)
+			require.Equal(t, float64(expectedCount), m.GetSummary().GetSampleSum(), "Cycle %d: Expected summary sample_sum %d", cycle, expectedCount)
+		}
+	}
+}
+
+// TestSoftRemoveAggregatedMetricsNeverDecrease verifies that aggregated metric values
+// (as seen by Prometheus through BuildMetricFamiliesPerTenant) never decrease across
+// the full lifecycle of add → observe → soft-remove → re-add → observe → soft-remove.
+// This is the end-to-end guarantee that prevents counter resets.
+func TestSoftRemoveAggregatedMetricsNeverDecrease(t *testing.T) {
+	tr := NewTenantRegistries(log.NewNopLogger())
+
+	sumOfCounters := func() float64 {
+		return tr.BuildMetricFamiliesPerTenant().GetSumOfCounters("test_counter")
+	}
+
+	sumOfHistogramCounts := func() uint64 {
+		var hd HistogramData
+		for _, entry := range tr.BuildMetricFamiliesPerTenant() {
+			entry.metrics.SumHistogramsTo("test_histogram", &hd)
+		}
+		return hd.Count()
+	}
+
+	sumOfSummaryCounts := func() uint64 {
+		var sd SummaryData
+		for _, entry := range tr.BuildMetricFamiliesPerTenant() {
+			entry.metrics.SumSummariesTo("test_summary", &sd)
+		}
+		return sd.sampleCount
+	}
+
+	var prevCounterSum float64
+	var prevHistCount uint64
+	var prevSummaryCount uint64
+
+	assertNonDecreasing := func(step string) {
+		cs := sumOfCounters()
+		hc := sumOfHistogramCounts()
+		sc := sumOfSummaryCounts()
+		require.GreaterOrEqual(t, cs, prevCounterSum, "%s: counter sum decreased (was %v, now %v)", step, prevCounterSum, cs)
+		require.GreaterOrEqual(t, hc, prevHistCount, "%s: histogram count decreased (was %v, now %v)", step, prevHistCount, hc)
+		require.GreaterOrEqual(t, sc, prevSummaryCount, "%s: summary count decreased (was %v, now %v)", step, prevSummaryCount, sc)
+		prevCounterSum = cs
+		prevHistCount = hc
+		prevSummaryCount = sc
+	}
+
+	for cycle := 0; cycle < 3; cycle++ {
+		// Add tenant and observe some metrics.
+		reg := prometheus.NewRegistry()
+		counter := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+			Name: "test_counter",
+			Help: "Test counter",
+		})
+		histogram := promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Name: "test_histogram",
+			Help: "Test histogram",
+		})
+		summary := promauto.With(reg).NewSummary(prometheus.SummaryOpts{
+			Name: "test_summary",
+			Help: "Test summary",
+		})
+
+		tr.AddTenantRegistry("tenant-a", reg)
+		assertNonDecreasing(fmt.Sprintf("cycle %d: after add", cycle))
+
+		// Simulate work.
+		counter.Add(5)
+		histogram.Observe(1)
+		histogram.Observe(2)
+		summary.Observe(1)
+		summary.Observe(2)
+		assertNonDecreasing(fmt.Sprintf("cycle %d: after observe", cycle))
+
+		// Soft-remove.
+		tr.RemoveTenantRegistry("tenant-a", false)
+		assertNonDecreasing(fmt.Sprintf("cycle %d: after soft-remove", cycle))
+	}
+
+	// After 3 cycles of counter.Add(5), the total should be 15.
+	require.Equal(t, float64(15), sumOfCounters(), "expected accumulated counter value across 3 cycles")
+	// After 3 cycles of 2 observations each, the total count should be 6.
+	require.Equal(t, uint64(6), sumOfHistogramCounts(), "expected accumulated histogram count across 3 cycles")
+	// After 3 cycles of 2 observations each, the total count should be 6.
+	require.Equal(t, uint64(6), sumOfSummaryCounts(), "expected accumulated summary count across 3 cycles")
 }

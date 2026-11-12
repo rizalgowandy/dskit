@@ -7,13 +7,14 @@ import (
 	"testing"
 
 	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-client-go"
 	jaegercfg "github.com/uber/jaeger-client-go/config"
 )
 
 func TestTracer_pprof_labels_propagation(t *testing.T) {
-	tt := initTestTracer(t)
+	tt := initTestTracer(t, 1)
 	defer func() { require.NoError(t, tt.Close()) }()
 
 	t.Run("root span name and ID are propagated as pprof labels", func(t *testing.T) {
@@ -24,6 +25,12 @@ func TestTracer_pprof_labels_propagation(t *testing.T) {
 		require.Equal(t, pprofLabels["span_name"], "RootSpan")
 		_, err := jaeger.SpanIDFromString(pprofLabels["span_id"])
 		require.NoError(t, err)
+		// trace_id is the 32-character W3C form of the span's trace ID.
+		traceID := pprofLabels["trace_id"]
+		require.Len(t, traceID, 32)
+		parsed, err := jaeger.TraceIDFromString(traceID)
+		require.NoError(t, err)
+		require.Equal(t, rootSpan.Context().(jaeger.SpanContext).TraceID(), parsed)
 		// Make sure the root span has "pyroscope.profile.id" attribute,
 		// and it matches the corresponding pprof label.
 		require.Equal(t, pprofLabels["span_id"], spanTags(rootSpan)["pyroscope.profile.id"])
@@ -78,7 +85,7 @@ func TestTracer_pprof_labels_propagation(t *testing.T) {
 	})
 }
 
-func initTestTracer(t *testing.T) io.Closer {
+func initTestTracer(t testing.TB, sampleRate float64) io.Closer {
 	t.Helper()
 	// We can't use mock tracer as we actually rely on the
 	// Jaeger tracer implementation details.
@@ -86,7 +93,7 @@ func initTestTracer(t *testing.T) io.Closer {
 		ServiceName: "test",
 		Sampler: &jaegercfg.SamplerConfig{
 			Type:  jaeger.SamplerTypeConst,
-			Param: 1,
+			Param: sampleRate,
 		},
 		Reporter: &jaegercfg.ReporterConfig{
 			LocalAgentHostPort: "127.0.0.100:16686",
@@ -125,4 +132,20 @@ func spanTags(span opentracing.Span) opentracing.Tags {
 		return nil
 	}
 	return s.Tags()
+}
+
+func BenchmarkTracer(b *testing.B) {
+	testTag := opentracing.Tag{Key: string(ext.Component), Value: "test"}
+	run := func(samplingRate float64) func(b *testing.B) {
+		return func(b *testing.B) {
+			tt := initTestTracer(b, samplingRate)
+			defer func() { require.NoError(b, tt.Close()) }()
+
+			for i := 0; i < b.N; i++ {
+				opentracing.StartSpan("foo", ext.RPCServerOption(nil), testTag)
+			}
+		}
+	}
+	b.Run("unsampled", run(0))
+	b.Run("sampled", run(1))
 }

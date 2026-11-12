@@ -13,6 +13,7 @@ const (
 
 	spanIDLabelName   = "span_id"
 	spanNameLabelName = "span_name"
+	traceIDLabelName  = "trace_id"
 )
 
 type tracer struct{ opentracing.Tracer }
@@ -41,6 +42,9 @@ func (t *tracer) StartSpan(operationName string, opts ...opentracing.StartSpanOp
 	if !ok {
 		return span
 	}
+	if !spanCtx.IsSampled() {
+		return span
+	}
 	// pprof labels are attached only once, at the span root level.
 	if !isRootSpan(opts...) {
 		return span
@@ -50,7 +54,7 @@ func (t *tracer) StartSpan(operationName string, opts ...opentracing.StartSpanOp
 	// concept: this makes it impossible to save an existing pprof context and
 	// all the original pprof labels associated with the goroutine.
 	ctx := context.Background()
-	return wrapJaegerSpanWithGoroutineLabels(ctx, span, operationName, sampledSpanID(spanCtx))
+	return wrapJaegerSpanWithGoroutineLabels(ctx, span, operationName, sampledSpanID(spanCtx), sampledTraceID(spanCtx))
 }
 
 // isRootSpan reports whether the span is a root span.

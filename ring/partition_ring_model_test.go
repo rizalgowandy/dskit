@@ -11,36 +11,6 @@ import (
 	"github.com/grafana/dskit/kv/memberlist"
 )
 
-func TestPartitionRingDesc_tokens(t *testing.T) {
-	desc := &PartitionRingDesc{
-		Partitions: map[int32]PartitionDesc{
-			1: {Tokens: []uint32{1, 5, 8}, State: PartitionActive, StateTimestamp: 10},
-			2: {Tokens: []uint32{3, 4, 9}, State: PartitionActive, StateTimestamp: 20},
-		},
-		Owners: map[string]OwnerDesc{
-			"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: 10},
-			"ingester-zone-b-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: 15},
-		},
-	}
-
-	assert.Equal(t, Tokens{1, 3, 4, 5, 8, 9}, desc.tokens())
-}
-
-func TestPartitionRingDesc_partitionByToken(t *testing.T) {
-	desc := &PartitionRingDesc{
-		Partitions: map[int32]PartitionDesc{
-			1: {Tokens: []uint32{1, 5, 8}, State: PartitionActive, StateTimestamp: 10},
-			2: {Tokens: []uint32{3, 4, 9}, State: PartitionActive, StateTimestamp: 20},
-		},
-		Owners: map[string]OwnerDesc{
-			"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: 10},
-			"ingester-zone-b-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: 15},
-		},
-	}
-
-	assert.Equal(t, map[Token]int32{1: 1, 5: 1, 8: 1, 3: 2, 4: 2, 9: 2}, desc.partitionByToken())
-}
-
 func TestPartitionRingDesc_countPartitionsByState(t *testing.T) {
 	t.Run("empty ring should return all states with 0 partitions each", func(t *testing.T) {
 		desc := &PartitionRingDesc{}
@@ -437,6 +407,32 @@ func TestPartitionRingDesc_Merge_UpdatePartition(t *testing.T) {
 				Owners: map[string]OwnerDesc{},
 			},
 		},
+		"token scheme and tokens are not merged": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: 10},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, TokenScheme: PartitionTokensSmt512, State: PartitionInactive, StateTimestamp: 20},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: 20},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: 20},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
 	}
 
 	for testName, testData := range tests {
@@ -456,6 +452,31 @@ func TestPartitionRingDesc_Merge_UpdatePartition(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPartitionRingDesc_Merge_StateChangeLocked(t *testing.T) {
+	now := time.Now()
+
+	// Initial state: locked=false
+	r1 := NewPartitionRingDesc()
+	r1.AddPartition(1, PartitionActive, now)
+	r1.UpdatePartitionStateChangeLock(1, false, now)
+
+	r2 := NewPartitionRingDesc()
+	r2.AddPartition(1, PartitionActive, now)
+	r2.UpdatePartitionStateChangeLock(1, true, now.Add(time.Second))
+
+	// Merge r2 into r1
+	merged, err := r1.Merge(r2, false)
+	assert.NoError(t, err)
+	assert.NotNil(t, merged)
+
+	// Verify r1 is updated
+	assert.True(t, r1.Partitions[1].StateChangeLocked)
+	assert.Equal(t, now.Add(time.Second).Unix(), r1.Partitions[1].StateChangeLockedTimestamp)
+
+	change := merged.(*PartitionRingDesc)
+	assert.True(t, change.Partitions[1].StateChangeLocked)
 }
 
 func TestPartitionRingDesc_Merge_RemovePartition(t *testing.T) {
@@ -1068,6 +1089,44 @@ func TestPartitionRingDesc_RemoveTombstones(t *testing.T) {
 	})
 }
 
+func TestPartitionRingDesc_UpdatePartitionState(t *testing.T) {
+	now := time.Now()
+
+	t.Run("should return error when state change is locked", func(t *testing.T) {
+		desc := NewPartitionRingDesc()
+		desc.AddPartition(1, PartitionActive, now)
+		desc.UpdatePartitionStateChangeLock(1, true, now)
+
+		changed, err := desc.UpdatePartitionState(1, PartitionInactive, now.Add(time.Second))
+		require.ErrorIs(t, err, ErrPartitionStateChangeLocked)
+		assert.False(t, changed)
+		// State should not be changed
+		assert.Equal(t, PartitionActive, desc.Partitions[1].State)
+		assert.Equal(t, now.Unix(), desc.Partitions[1].StateTimestamp)
+	})
+
+	t.Run("should update state after lock is released", func(t *testing.T) {
+		desc := NewPartitionRingDesc()
+		desc.AddPartition(1, PartitionActive, now)
+
+		// Lock the state change
+		desc.UpdatePartitionStateChangeLock(1, true, now)
+
+		// Try to update state - should fail
+		changed, err := desc.UpdatePartitionState(1, PartitionInactive, now.Add(time.Second))
+		require.ErrorIs(t, err, ErrPartitionStateChangeLocked)
+		assert.False(t, changed)
+
+		desc.UpdatePartitionStateChangeLock(1, false, now.Add(2*time.Second))
+
+		// Try to update state - should succeed
+		changed, err = desc.UpdatePartitionState(1, PartitionInactive, now.Add(3*time.Second))
+		require.NoError(t, err)
+		assert.True(t, changed)
+		assert.Equal(t, PartitionInactive, desc.Partitions[1].State)
+	})
+}
+
 func TestPartitionRingDesc_PartitionOwnersCountUpdatedBefore(t *testing.T) {
 	now := time.Now()
 
@@ -1082,4 +1141,347 @@ func TestPartitionRingDesc_PartitionOwnersCountUpdatedBefore(t *testing.T) {
 	assert.Equal(t, 2, desc.PartitionOwnersCountUpdatedBefore(1, now))
 	assert.Equal(t, 1, desc.PartitionOwnersCountUpdatedBefore(1, now.Add(-1*time.Second)))
 	assert.Equal(t, 0, desc.PartitionOwnersCountUpdatedBefore(1, now.Add(-2*time.Second)))
+}
+
+func TestPartitionRingDesc_Merge_FutureTimestamps(t *testing.T) {
+	now := time.Unix(10000, 0)
+	valid := now.Unix()
+	withinSkew := now.Add(maxFutureTimestampSkew).Unix()
+	skewed := now.Add(90 * 24 * time.Hour).Unix()
+
+	tests := map[string]struct {
+		localCAS             bool
+		local                *PartitionRingDesc
+		incoming             *PartitionRingDesc
+		expectedUpdatedLocal memberlist.Mergeable
+		expectedChange       memberlist.Mergeable
+	}{
+		"incoming partition state too far in the future is ignored": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: skewed},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: nil,
+		},
+		"incoming partition state in the future within the allowed skew is accepted": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: withinSkew},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: withinSkew},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: withinSkew},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
+		"incoming new partition with state too far in the future is not added": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners:     map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: skewed},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners:     map[string]OwnerDesc{},
+			},
+			expectedChange: nil,
+		},
+		"incoming new partition with only state change lock too far in the future is added": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners:     map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
+		"local state change lock too far in the future is replaced by an incoming never locked one": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
+		"incoming partition state change lock too far in the future is ignored": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid - 10, StateChangeLockedTimestamp: valid - 10},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: valid, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: valid, StateChangeLockedTimestamp: valid - 10},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: valid, StateChangeLockedTimestamp: valid - 10},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
+		"local partition timestamps too far in the future are replaced by older incoming ones": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: skewed, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLockedTimestamp: valid},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLockedTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: valid, StateChangeLockedTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
+		"local partition too far in the future is not replaced by itself": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: skewed, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: skewed, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionInactive, StateTimestamp: skewed, StateChangeLocked: true, StateChangeLockedTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: nil,
+		},
+		"local CAS removing a partition too far in the future marks it as deleted now": {
+			localCAS: true,
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionActive, StateTimestamp: skewed},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			incoming: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionDeleted, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{
+					1: {Id: 1, Tokens: []uint32{1, 2, 3}, State: PartitionDeleted, StateTimestamp: valid},
+				},
+				Owners: map[string]OwnerDesc{},
+			},
+		},
+		"incoming owner too far in the future is ignored": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: valid},
+				},
+			},
+			incoming: &PartitionRingDesc{
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerDeleted, UpdatedTimestamp: skewed},
+					"ingester-zone-b-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: skewed},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: valid},
+				},
+			},
+			expectedChange: nil,
+		},
+		"local owner too far in the future is replaced by an older incoming one": {
+			local: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerActive, UpdatedTimestamp: skewed},
+				},
+			},
+			incoming: &PartitionRingDesc{
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerDeleted, UpdatedTimestamp: valid},
+				},
+			},
+			expectedUpdatedLocal: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerDeleted, UpdatedTimestamp: valid},
+				},
+			},
+			expectedChange: &PartitionRingDesc{
+				Partitions: map[int32]PartitionDesc{},
+				Owners: map[string]OwnerDesc{
+					"ingester-zone-a-0": {OwnedPartition: 1, State: OwnerDeleted, UpdatedTimestamp: valid},
+				},
+			},
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			var (
+				localCopy    = testData.local.Clone().(*PartitionRingDesc)
+				incomingCopy = testData.incoming.Clone()
+			)
+
+			change, err := localCopy.mergeWithTime(incomingCopy, testData.localCAS, now)
+			require.NoError(t, err)
+			assert.Equal(t, testData.expectedUpdatedLocal, localCopy)
+			assert.Equal(t, testData.expectedChange, change)
+		})
+	}
+}
+
+func TestPartitionRingDesc_MergeContent(t *testing.T) {
+	now := time.Now()
+
+	t.Run("empty ring", func(t *testing.T) {
+		require.Empty(t, NewPartitionRingDesc().MergeContent())
+	})
+
+	t.Run("returns exactly the partition and owner IDs", func(t *testing.T) {
+		desc := NewPartitionRingDesc()
+		desc.AddPartition(1, PartitionActive, now)
+		desc.AddPartition(2, PartitionActive, now)
+		desc.AddOrUpdateOwner("ingester-zone-a-0", OwnerActive, 1, now)
+
+		require.ElementsMatch(t, []string{"1", "2", "ingester-zone-a-0"}, desc.MergeContent())
+	})
+}
+
+func TestPartitionRingDesc_TokenSchemeSurvivesEncodeAndClone(t *testing.T) {
+	for _, scheme := range []PartitionTokenScheme{PartitionTokensStored, PartitionTokensSmt512, 99} {
+		t.Run(fmt.Sprint(scheme), func(t *testing.T) {
+			desc := NewPartitionRingDesc()
+			desc.Partitions[1] = PartitionDesc{Id: 1, Tokens: []uint32{10}, TokenScheme: scheme, State: PartitionActive, StateTimestamp: 1}
+			encoded, err := GetPartitionRingCodec().Encode(desc)
+			require.NoError(t, err)
+			decoded, err := GetPartitionRingCodec().Decode(encoded)
+			require.NoError(t, err)
+			assert.Equal(t, desc, decoded)
+			assert.Equal(t, desc, desc.Clone())
+		})
+	}
+}
+
+func BenchmarkPartitionRing_TokenSchemeEncodedSize(b *testing.B) {
+	tokens, err := generatePartitionTokens(4524)
+	require.NoError(b, err)
+	for _, count := range []int{100, 512, 2048, 4525} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			stored, derived := partitionRingTokenSchemeDescriptors(tokens[:count])
+			codec := GetPartitionRingCodec()
+			var storedBytes, derivedBytes []byte
+			for b.Loop() {
+				var err error
+				storedBytes, err = codec.Encode(stored)
+				require.NoError(b, err)
+				derivedBytes, err = codec.Encode(derived)
+				require.NoError(b, err)
+			}
+			b.ReportMetric(float64(len(storedBytes)), "stored-bytes/ring")
+			b.ReportMetric(float64(len(storedBytes))/float64(count), "stored-bytes/partition")
+			b.ReportMetric(float64(len(derivedBytes)), "derived-bytes/ring")
+			b.ReportMetric(float64(len(derivedBytes))/float64(count), "derived-bytes/partition")
+		})
+	}
+}
+
+func partitionRingTokenSchemeDescriptors(tokens []Tokens) (*PartitionRingDesc, *PartitionRingDesc) {
+	stored, derived := NewPartitionRingDesc(), NewPartitionRingDesc()
+	for id, partitionTokens := range tokens {
+		stored.Partitions[int32(id)] = PartitionDesc{Id: int32(id), Tokens: partitionTokens, State: PartitionActive, StateTimestamp: 1700000000}
+		derived.AddPartitionWithDerivedTokens(int32(id), PartitionActive, time.Unix(1700000000, 0))
+	}
+	return stored, derived
 }

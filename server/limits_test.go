@@ -10,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	protobuf "github.com/golang/protobuf/ptypes/empty"
+	"github.com/go-kit/log"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/grafana/dskit/test"
 )
@@ -28,12 +30,12 @@ func TestGrpcLimitCheckMalformedMethodName(t *testing.T) {
 	ts := &testServer{finishRequest: make(chan struct{})}
 	ml := &methodLimiter{protectedMethod: badMethodName}
 
-	limitCheck := newGrpcInflightLimitCheck(ml)
+	limitCheck := newGrpcInflightLimitCheck(ml, log.NewNopLogger())
 
 	c := setupGrpcServerWithCheckAndClient(t, ts, limitCheck)
 
-	out := &protobuf.Empty{}
-	err := c.(*fakeServerClient).cc.Invoke(context.Background(), badMethodName, &protobuf.Empty{}, out)
+	out := &emptypb.Empty{}
+	err := c.(*fakeServerClient).cc.Invoke(context.Background(), badMethodName, &emptypb.Empty{}, out)
 
 	require.Error(t, err)
 	s, ok := status.FromError(err)
@@ -53,19 +55,19 @@ func checkGrpcStatusError(t *testing.T, err error, code codes.Code, msg string) 
 }
 
 func callToSucceed(ctx context.Context, c FakeServerClient) error {
-	_, err := c.Succeed(ctx, &protobuf.Empty{})
+	_, err := c.Succeed(ctx, &emptypb.Empty{})
 	return err
 }
 
 func callToSleep(ctx context.Context, c FakeServerClient) error {
-	_, err := c.Sleep(ctx, &protobuf.Empty{})
+	_, err := c.Sleep(ctx, &emptypb.Empty{})
 	return err
 }
 
 func callToStreaming(msgsPerStreamCall int) func(ctx context.Context, c FakeServerClient) error {
 	return func(ctx context.Context, c FakeServerClient) error {
 		rcvd := 0
-		s, err := c.StreamSleep(ctx, &protobuf.Empty{})
+		s, err := c.StreamSleep(ctx, &emptypb.Empty{})
 		if err != nil {
 			return err
 		}
@@ -136,7 +138,7 @@ func testGrpcLimitCheckWithMethodLimiter(
 	ts := &testServer{finishRequest: make(chan struct{}), msgPerStreamCall: msgsPerStreamCall}
 	ml := &methodLimiter{protectedMethod: protectedMethodName, allInflightLimit: inflightLimit, protectedMethodInflightLimit: protectedMethodLimit}
 
-	limitCheck := newGrpcInflightLimitCheck(ml)
+	limitCheck := newGrpcInflightLimitCheck(ml, log.NewNopLogger())
 
 	c := setupGrpcServerWithCheckAndClient(t, ts, limitCheck)
 
@@ -218,8 +220,15 @@ func testGrpcLimitCheckWithMethodLimiter(
 	close(ts.finishRequest)
 	finished.Wait()
 
-	require.Equal(t, int64(0), ml.allInflight.Load())
-	require.Equal(t, int64(0), ml.protectedMethodInflight.Load())
+	// Wait for the server's stats handler to process RPCCallFinished for all requests.
+	// The client goroutines may complete before the server's stats.End event fires,
+	// which decrements the counters. Using Poll avoids this race condition.
+	test.Poll(t, 1*time.Second, int64(0), func() interface{} {
+		return ml.allInflight.Load()
+	})
+	test.Poll(t, 1*time.Second, int64(0), func() interface{} {
+		return ml.protectedMethodInflight.Load()
+	})
 
 	// Another request to protected or unprotected method should succeed again.
 	for _, fn := range append(callsToUnprotectedMethods, callToProtectedMethod) {
@@ -230,6 +239,191 @@ func testGrpcLimitCheckWithMethodLimiter(
 		err = fn(metadata.AppendToOutgoingContext(context.Background(), metaAbortRequest, "true"), c)
 		checkGrpcStatusError(t, err, codes.Aborted, "aborted")
 	}
+}
+
+// This test covers an edge case described in https://github.com/grafana/dskit/issues/749
+// A shortcut to an early return right after checking the tap handle introduced https://github.com/grpc/grpc-go/pull/8439
+// may cause stats handler not be executed, and thus the RPCCallFinished not being called.
+// In this test we simulate that by waiting in the tap handle until the request context is already expired.
+// Then we check that actually the RPCCallFinished was not called.
+// Then we execute the scheduled timer function, and check that RPCCallFinished is called from there.
+func TestGrpcLimitCheckWithContextDeadlineExpiredRightAfterTapHandleCheck(t *testing.T) {
+	rpcCallFinishedCalled := atomic.NewBool(false)
+
+	ts := &testServer{finishRequest: make(chan struct{}), msgPerStreamCall: 5}
+	// All requests finish instantly.
+	close(ts.finishRequest)
+	ml := funcMethodLimiter{
+		rpcCallStarting: func(ctx context.Context, methodName string, md metadata.MD) (context.Context, error) {
+			// When this is called from the tap handle, the request shouldn't have expired yet.
+			select {
+			case <-ctx.Done():
+				t.Error("context should not be done yet")
+			default:
+			}
+
+			// This tap handle waits until the request context is already expired.
+			<-ctx.Done()
+			return ctx, nil
+		},
+		rpcCallProcessing: func(_ context.Context, _ string) (func(error), error) { return nil, nil },
+		rpcCallFinished: func(ctx context.Context) {
+			rpcCallFinishedCalled.Store(true)
+		},
+	}
+
+	timerFuncs := make(chan func(), 1)
+
+	limitCheck := newGrpcInflightLimitCheck(ml, log.NewNopLogger())
+	limitCheck.timeAfterFuncMock = func(d time.Duration, f func()) testableTimer {
+		assert.Equal(t, unprocessedRequestCheckTimeout, d)
+		timerFuncs <- f
+		return testableTimer{stop: func() bool {
+			t.Error("Timer.Stop() should not be called, because the request context was already expired when TapHandle was called. If stop was called, maybe the gRPC shortcut was removed?")
+			return false
+		}}
+	}
+
+	c := setupGrpcServerWithCheckAndClient(t, ts, limitCheck)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := c.Succeed(ctx, &emptypb.Empty{})
+	require.Error(t, err)
+	s, ok := status.FromError(err)
+	require.True(t, ok)
+	require.Equal(t, codes.DeadlineExceeded, s.Code())
+
+	// Get the function that was scheduled with a timer.
+	var timerFunc func()
+	select {
+	case timerFunc = <-timerFuncs:
+	case <-time.After(time.Second):
+		t.Fatal("expected timer function to be scheduled when the request is already finished")
+	}
+
+	require.False(t, rpcCallFinishedCalled.Load(), "RPCFinishedCall should not have been called yet, because of the shortcut in the grpc library."+
+		" If this test fails here, then maybe grpc library changed, please review and check whether the test has to be updated or all this logic should be removed.")
+
+	// We know that Timer.Stop() wasn't called (because it would be stuck on trying to push to stopResult channel).
+	// Execute the timer.
+	timerFunc()
+
+	// Now check that RPCCallFinished was called.
+	require.True(t, rpcCallFinishedCalled.Load(), "expected RPCCallFinished to be called when the unprocessed request timer fires")
+}
+
+// This test covers an edge case of an edge case described in https://github.com/grafana/dskit/issues/749
+// It describes a scenario where the timer fires but the request context is still not canceled.
+// In this scenario the request is processed and context is not canceled.
+func TestGrpcLimitCheckTimerFiresButRequestIsBeingProcessedCallsRPCCallFinishedOnlyOnce(t *testing.T) {
+	rpcCallFinishedCalled := atomic.NewInt64(0)
+
+	ts := &testServer{finishRequest: make(chan struct{}), msgPerStreamCall: 5}
+	ml := funcMethodLimiter{
+		rpcCallStarting: func(ctx context.Context, methodName string, md metadata.MD) (context.Context, error) {
+			// When this is called from the tap handle, the request shouldn't have expired yet.
+			select {
+			case <-ctx.Done():
+				t.Error("context should not be done yet")
+			default:
+			}
+
+			// This tap handle waits until the request context is already expired.
+			<-ctx.Done()
+			return ctx, nil
+		},
+		rpcCallProcessing: func(_ context.Context, _ string) (func(error), error) { return nil, nil },
+		rpcCallFinished: func(ctx context.Context) {
+			rpcCallFinishedCalled.Inc()
+		},
+	}
+
+	timerExecuted := make(chan struct{})
+	limitCheck := newGrpcInflightLimitCheck(ml, log.NewNopLogger())
+	limitCheck.timeAfterFuncMock = func(d time.Duration, f func()) testableTimer {
+		// Fire immediately.
+		go func() {
+			f()
+			close(timerExecuted)
+		}()
+		return testableTimer{stop: func() bool {
+			// Tell we already fired the timer.
+			return true
+		}}
+	}
+
+	c := setupGrpcServerWithCheckAndClient(t, ts, limitCheck)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		// Let the request finish only after the timer is finished.
+		// We're trying to force both the timer and the request to run RPCCallFinished.
+		// (That should not happen).
+		<-timerExecuted
+		close(ts.finishRequest)
+	}()
+
+	_, err := c.Succeed(ctx, &emptypb.Empty{})
+	require.Error(t, err)
+	s, ok := status.FromError(err)
+	require.True(t, ok)
+	require.Equal(t, codes.DeadlineExceeded, s.Code())
+
+	// Wait until timer has been executed.
+	select {
+	case <-timerExecuted:
+	case <-time.After(time.Second):
+		t.Fatal("expected timer function to be executed")
+	}
+
+	// Check that RPCCallFinished was called only once.
+	require.Equal(t, int64(1), rpcCallFinishedCalled.Load(), "expected RPCCallFinished to be called only once")
+}
+
+// This checks that the bugfix timer for https://github.com/grafana/dskit/issues/749 is actually canceled before being executed.
+func TestGrpcLimitCheckSuccessfulRequestCancelsTheTimer(t *testing.T) {
+	rpcCallFinishedCalled := atomic.NewBool(false)
+
+	ts := &testServer{finishRequest: make(chan struct{}), msgPerStreamCall: 5}
+	// All requests finish instantly.
+	close(ts.finishRequest)
+	ml := funcMethodLimiter{
+		rpcCallStarting: func(ctx context.Context, methodName string, md metadata.MD) (context.Context, error) {
+			return ctx, nil
+		},
+		rpcCallProcessing: func(_ context.Context, _ string) (func(error), error) { return nil, nil },
+		rpcCallFinished: func(ctx context.Context) {
+			rpcCallFinishedCalled.Store(true)
+		},
+	}
+
+	stopWasCalled := atomic.NewBool(false)
+
+	limitCheck := newGrpcInflightLimitCheck(ml, log.NewNopLogger())
+	limitCheck.timeAfterFuncMock = func(d time.Duration, f func()) testableTimer {
+		assert.Equal(t, unprocessedRequestCheckTimeout, d)
+		return testableTimer{stop: func() bool {
+			stopWasCalled.Store(true)
+			return true
+		}}
+	}
+
+	c := setupGrpcServerWithCheckAndClient(t, ts, limitCheck)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := c.Succeed(ctx, &emptypb.Empty{})
+	require.NoError(t, err)
+
+	// Check that stop was called
+	require.True(t, stopWasCalled.Load(), "expected Timer.Stop() to be called, because the request was successful")
+	// Check that RPCCallFinished was called from the normal flow, not from the timer function.
+	require.True(t, rpcCallFinishedCalled.Load(), "expected RPCCallFinished to be called when the request finished")
 }
 
 func setupGrpcServerWithCheckAndClient(t *testing.T, ts *testServer, g *grpcInflightLimitCheck) FakeServerClient {
@@ -247,7 +441,7 @@ func setupGrpcServerWithCheckAndClient(t *testing.T, ts *testServer, g *grpcInfl
 		_ = l.Close()
 	})
 
-	cc, err := grpc.Dial(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cc, err := grpc.NewClient(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -264,19 +458,19 @@ type testServer struct {
 	finishRequest    chan struct{}
 }
 
-func (ts *testServer) Succeed(_ context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
+func (ts *testServer) Succeed(_ context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	<-ts.finishRequest
-	return &protobuf.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (ts *testServer) Sleep(_ context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
+func (ts *testServer) Sleep(_ context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	<-ts.finishRequest
-	return &protobuf.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (ts *testServer) StreamSleep(_ *protobuf.Empty, stream FakeServer_StreamSleepServer) error {
+func (ts *testServer) StreamSleep(_ *emptypb.Empty, stream FakeServer_StreamSleepServer) error {
 	for i := 0; i < ts.msgPerStreamCall; i++ {
-		_ = stream.Send(&protobuf.Empty{})
+		_ = stream.Send(&emptypb.Empty{})
 		<-ts.finishRequest
 	}
 	return nil
@@ -322,6 +516,10 @@ func (m *methodLimiter) RPCCallStarting(ctx context.Context, methodName string, 
 	return context.WithValue(ctx, ctxMethodName, methodName), nil
 }
 
+func (m *methodLimiter) RPCCallProcessing(_ context.Context, _ string) (func(error), error) {
+	return nil, nil
+}
+
 func (m *methodLimiter) RPCCallFinished(ctx context.Context) {
 	m.allInflight.Dec()
 
@@ -329,4 +527,22 @@ func (m *methodLimiter) RPCCallFinished(ctx context.Context) {
 	if methodName == m.protectedMethod && m.protectedMethodInflightLimit > 0 {
 		m.protectedMethodInflight.Dec()
 	}
+}
+
+type funcMethodLimiter struct {
+	rpcCallStarting   func(ctx context.Context, methodName string, md metadata.MD) (context.Context, error)
+	rpcCallProcessing func(_ context.Context, _ string) (func(error), error)
+	rpcCallFinished   func(ctx context.Context)
+}
+
+func (f funcMethodLimiter) RPCCallStarting(ctx context.Context, methodName string, md metadata.MD) (context.Context, error) {
+	return f.rpcCallStarting(ctx, methodName, md)
+}
+
+func (f funcMethodLimiter) RPCCallProcessing(ctx context.Context, methodName string) (func(error), error) {
+	return f.rpcCallProcessing(ctx, methodName)
+}
+
+func (f funcMethodLimiter) RPCCallFinished(ctx context.Context) {
+	f.rpcCallFinished(ctx)
 }

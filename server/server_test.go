@@ -13,29 +13,35 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	gokit_log "github.com/go-kit/log"
+	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
-	protobuf "github.com/golang/protobuf/ptypes/empty"
-	"github.com/gorilla/mux"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stretchr/testify/require"
-
+	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/log"
 	"github.com/grafana/dskit/middleware"
@@ -43,27 +49,27 @@ import (
 
 type FakeServer struct{}
 
-func (f FakeServer) FailWithError(_ context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
+func (f FakeServer) FailWithError(_ context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	return nil, errors.New("test error")
 }
 
-func (f FakeServer) FailWithHTTPError(_ context.Context, req *FailWithHTTPErrorRequest) (*protobuf.Empty, error) {
-	return nil, httpgrpc.Errorf(int(req.Code), strconv.Itoa(int(req.Code)))
+func (f FakeServer) FailWithHTTPError(_ context.Context, req *FailWithHTTPErrorRequest) (*emptypb.Empty, error) {
+	return nil, httpgrpc.Errorf(int(req.Code), "%d", req.Code)
 }
 
-func (f FakeServer) Succeed(_ context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
-	return &protobuf.Empty{}, nil
+func (f FakeServer) Succeed(_ context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }
 
-func (f FakeServer) Sleep(ctx context.Context, _ *protobuf.Empty) (*protobuf.Empty, error) {
+func (f FakeServer) Sleep(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
 	err := cancelableSleep(ctx, 10*time.Second)
-	return &protobuf.Empty{}, err
+	return &emptypb.Empty{}, err
 }
 
-func (f FakeServer) StreamSleep(_ *protobuf.Empty, stream FakeServer_StreamSleepServer) error {
+func (f FakeServer) StreamSleep(_ *emptypb.Empty, stream FakeServer_StreamSleepServer) error {
 	for x := 0; x < 100; x++ {
 		time.Sleep(time.Second / 100.0)
-		if err := stream.Send(&protobuf.Empty{}); err != nil {
+		if err := stream.Send(&emptypb.Empty{}); err != nil {
 			return err
 		}
 	}
@@ -78,7 +84,7 @@ func cancelableSleep(ctx context.Context, sleep time.Duration) error {
 	return ctx.Err()
 }
 
-func (f FakeServer) ReturnProxyProtoCallerIP(ctx context.Context, _ *protobuf.Empty) (*ProxyProtoIPResponse, error) {
+func (f FakeServer) ReturnProxyProtoCallerIP(ctx context.Context, _ *emptypb.Empty) (*ProxyProtoIPResponse, error) {
 	p, _ := peer.FromContext(ctx)
 	ip, _, err := net.SplitHostPort(p.Addr.String())
 	if err != nil {
@@ -89,50 +95,13 @@ func (f FakeServer) ReturnProxyProtoCallerIP(ctx context.Context, _ *protobuf.Em
 	}, nil
 }
 
-func TestTCPv4Network(t *testing.T) {
-	var cfg Config
-	setAutoAssignedPorts(NetworkTCPV4, &cfg)
-
-	t.Run("http", func(t *testing.T) {
-		var level log.Level
-		require.NoError(t, level.Set("info"))
-		cfg.LogLevel = level
-		cfg.MetricsNamespace = "testing_http_tcp4"
-		srv, err := New(cfg)
-		require.NoError(t, err)
-
-		errChan := make(chan error, 1)
-		go func() {
-			errChan <- srv.Run()
-		}()
-
-		require.NoError(t, srv.httpListener.Close())
-		require.NotNil(t, <-errChan)
-
-		// So that address is freed for further tests.
-		srv.GRPC.Stop()
-	})
-
-	t.Run("grpc", func(t *testing.T) {
-		cfg.MetricsNamespace = "testing_grpc_tcp4"
-		srv, err := New(cfg)
-		require.NoError(t, err)
-
-		errChan := make(chan error, 1)
-		go func() {
-			errChan <- srv.Run()
-		}()
-
-		require.NoError(t, srv.grpcListener.Close())
-		require.NotNil(t, <-errChan)
-	})
-}
-
 // Ensure that http and grpc servers work with no overrides to config
 // (except http port because an ordinary user can't bind to default port 80)
 func TestDefaultAddresses(t *testing.T) {
 	var cfg Config
 	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
+	cfg.GRPCListenAddress = "localhost"
+	cfg.HTTPListenAddress = "localhost"
 	cfg.HTTPListenPort = 9090
 	cfg.MetricsNamespace = "testing_addresses"
 
@@ -142,7 +111,7 @@ func TestDefaultAddresses(t *testing.T) {
 	fakeServer := FakeServer{}
 	RegisterFakeServerServer(server.GRPC, fakeServer)
 
-	server.HTTP.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/test", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(204)
 	})
 
@@ -151,11 +120,11 @@ func TestDefaultAddresses(t *testing.T) {
 	}()
 	defer server.Shutdown()
 
-	conn, err := grpc.Dial("localhost:9095", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient("localhost:9095", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer conn.Close()
 
-	empty := protobuf.Empty{}
+	empty := emptypb.Empty{}
 	client := NewFakeServerClient(conn)
 	_, err = client.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
@@ -181,15 +150,15 @@ func TestErrorInstrumentationMiddleware(t *testing.T) {
 	fakeServer := FakeServer{}
 	RegisterFakeServerServer(server.GRPC, fakeServer)
 
-	server.HTTP.HandleFunc("/succeed", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/succeed", func(http.ResponseWriter, *http.Request) {
 	})
-	server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(500)
 	})
-	server.HTTP.HandleFunc("/sleep10", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/sleep10", func(_ http.ResponseWriter, r *http.Request) {
 		_ = cancelableSleep(r.Context(), time.Second*10)
 	})
-	server.HTTP.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 
@@ -197,14 +166,15 @@ func TestErrorInstrumentationMiddleware(t *testing.T) {
 		require.NoError(t, server.Run())
 	}()
 
-	conn, err := grpc.Dial(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer conn.Close()
 
-	empty := protobuf.Empty{}
+	empty := emptypb.Empty{}
 	client := NewFakeServerClient(conn)
 	res, err := client.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
+	empty.Reset()
 	require.EqualValues(t, &empty, res)
 
 	res, err = client.FailWithError(context.Background(), &empty)
@@ -316,19 +286,25 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 	prometheus.DefaultGatherer = reg
 
 	var cfg Config
+	cfg.PerTenantInstrumentation = func(_ context.Context) *middleware.PerTenantConfig {
+		return &middleware.PerTenantConfig{
+			TenantID:     "test",
+			TotalCounter: true,
+		}
+	}
 	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
 	setAutoAssignedPorts(DefaultNetwork, &cfg)
 
 	server, err := New(cfg)
 	require.NoError(t, err)
 
-	server.HTTP.HandleFunc("/succeed", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/succeed", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("OK"))
 	})
-	server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(500)
 	})
-	server.HTTP.HandleFunc("/sleep10", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/sleep10", func(_ http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body) // Consume body, otherwise it's not counted.
 		_ = cancelableSleep(r.Context(), time.Second*10)
 	})
@@ -385,76 +361,118 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 
 		# HELP request_message_bytes Size (in bytes) of messages received in the request.
 		# TYPE request_message_bytes histogram
+		request_message_bytes_bucket{method="GET",route="error500",le="4"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="16"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="64"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="256"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="1024"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="4096"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="16384"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="65536"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="262144"} 1
 		request_message_bytes_bucket{method="GET",route="error500",le="1.048576e+06"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="2.62144e+06"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="5.24288e+06"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="1.048576e+07"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="2.62144e+07"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="5.24288e+07"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="1.048576e+08"} 1
-		request_message_bytes_bucket{method="GET",route="error500",le="2.62144e+08"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="4.194304e+06"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="1.6777216e+07"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="6.7108864e+07"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="2.68435456e+08"} 1
+		request_message_bytes_bucket{method="GET",route="error500",le="1.073741824e+09"} 1
 		request_message_bytes_bucket{method="GET",route="error500",le="+Inf"} 1
 		request_message_bytes_sum{method="GET",route="error500"} 0
 		request_message_bytes_count{method="GET",route="error500"} 1
 
+		request_message_bytes_bucket{method="POST",route="sleep10",le="4"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="16"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="64"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="256"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="1024"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="4096"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="16384"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="65536"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="262144"} 1
 		request_message_bytes_bucket{method="POST",route="sleep10",le="1.048576e+06"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="2.62144e+06"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="5.24288e+06"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="1.048576e+07"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="2.62144e+07"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="5.24288e+07"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="1.048576e+08"} 1
-		request_message_bytes_bucket{method="POST",route="sleep10",le="2.62144e+08"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="4.194304e+06"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="1.6777216e+07"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="6.7108864e+07"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="2.68435456e+08"} 1
+		request_message_bytes_bucket{method="POST",route="sleep10",le="1.073741824e+09"} 1
 		request_message_bytes_bucket{method="POST",route="sleep10",le="+Inf"} 1
 		request_message_bytes_sum{method="POST",route="sleep10"} 4
 		request_message_bytes_count{method="POST",route="sleep10"} 1
-
+		
+		request_message_bytes_bucket{method="GET",route="succeed",le="4"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="16"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="64"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="256"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="1024"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="4096"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="16384"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="65536"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="262144"} 1
 		request_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+06"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+06"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+06"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+07"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+07"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+07"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+08"} 1
-		request_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+08"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="4.194304e+06"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="1.6777216e+07"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="6.7108864e+07"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="2.68435456e+08"} 1
+		request_message_bytes_bucket{method="GET",route="succeed",le="1.073741824e+09"} 1
 		request_message_bytes_bucket{method="GET",route="succeed",le="+Inf"} 1
 		request_message_bytes_sum{method="GET",route="succeed"} 0
 		request_message_bytes_count{method="GET",route="succeed"} 1
 
 		# HELP response_message_bytes Size (in bytes) of messages sent in response.
 		# TYPE response_message_bytes histogram
+		response_message_bytes_bucket{method="GET",route="error500",le="4"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="16"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="64"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="256"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="1024"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="4096"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="16384"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="65536"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="262144"} 1
 		response_message_bytes_bucket{method="GET",route="error500",le="1.048576e+06"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="2.62144e+06"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="5.24288e+06"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="1.048576e+07"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="2.62144e+07"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="5.24288e+07"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="1.048576e+08"} 1
-		response_message_bytes_bucket{method="GET",route="error500",le="2.62144e+08"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="4.194304e+06"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="1.6777216e+07"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="6.7108864e+07"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="2.68435456e+08"} 1
+		response_message_bytes_bucket{method="GET",route="error500",le="1.073741824e+09"} 1
 		response_message_bytes_bucket{method="GET",route="error500",le="+Inf"} 1
 		response_message_bytes_sum{method="GET",route="error500"} 0
 		response_message_bytes_count{method="GET",route="error500"} 1
 
+		response_message_bytes_bucket{method="POST",route="sleep10",le="4"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="16"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="64"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="256"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="1024"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="4096"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="16384"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="65536"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="262144"} 1
 		response_message_bytes_bucket{method="POST",route="sleep10",le="1.048576e+06"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="2.62144e+06"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="5.24288e+06"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="1.048576e+07"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="2.62144e+07"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="5.24288e+07"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="1.048576e+08"} 1
-		response_message_bytes_bucket{method="POST",route="sleep10",le="2.62144e+08"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="4.194304e+06"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="1.6777216e+07"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="6.7108864e+07"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="2.68435456e+08"} 1
+		response_message_bytes_bucket{method="POST",route="sleep10",le="1.073741824e+09"} 1
 		response_message_bytes_bucket{method="POST",route="sleep10",le="+Inf"} 1
 		response_message_bytes_sum{method="POST",route="sleep10"} 0
 		response_message_bytes_count{method="POST",route="sleep10"} 1
 
+		response_message_bytes_bucket{method="GET",route="succeed",le="4"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="16"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="64"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="256"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="1024"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="4096"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="16384"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="65536"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="262144"} 1
 		response_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+06"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+06"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+06"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+07"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+07"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="5.24288e+07"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="1.048576e+08"} 1
-		response_message_bytes_bucket{method="GET",route="succeed",le="2.62144e+08"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="4.194304e+06"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="1.6777216e+07"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="6.7108864e+07"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="2.68435456e+08"} 1
+		response_message_bytes_bucket{method="GET",route="succeed",le="1.073741824e+09"} 1
 		response_message_bytes_bucket{method="GET",route="succeed",le="+Inf"} 1
 		response_message_bytes_sum{method="GET",route="succeed"} 2
 		response_message_bytes_count{method="GET",route="succeed"} 1
@@ -463,46 +481,71 @@ func TestHTTPInstrumentationMetrics(t *testing.T) {
 		# TYPE tcp_connections gauge
 		tcp_connections{protocol="http"} 0
 		tcp_connections{protocol="grpc"} 0
-	`), "request_message_bytes", "response_message_bytes", "inflight_requests", "tcp_connections"))
+
+		# HELP per_tenant_request_total Total count of requests for a particular tenant.
+        # TYPE per_tenant_request_total counter
+        per_tenant_request_total{method="GET",route="error500",status_code="500",tenant="test",ws="false"} 1
+        per_tenant_request_total{method="GET",route="succeed",status_code="200",tenant="test",ws="false"} 1
+        per_tenant_request_total{method="POST",route="sleep10",status_code="200",tenant="test",ws="false"} 1
+	`), "request_message_bytes", "response_message_bytes", "inflight_requests", "tcp_connections", "per_tenant_request_duration_seconds", "per_tenant_request_total"))
 }
 
 func TestRunReturnsError(t *testing.T) {
-	var cfg Config
-	setAutoAssignedPorts(DefaultNetwork, &cfg)
+	testCases := []struct {
+		protocol string
+	}{
+		{
+			protocol: "http",
+		},
+		{
+			protocol: "grpc",
+		},
+	}
+	for _, tc := range testCases {
+		for _, network := range []string{"default", "tcpV4"} {
+			t.Run(network, func(t *testing.T) {
+				var level log.Level
+				require.NoError(t, level.Set("info"))
+				cfg := Config{
+					Registerer:       prometheus.NewPedanticRegistry(),
+					LogLevel:         level,
+					MetricsNamespace: fmt.Sprintf("testing_%s", tc.protocol),
+				}
+				switch network {
+				case "default":
+					setAutoAssignedPorts(DefaultNetwork, &cfg)
+				case "tcpV4":
+					setAutoAssignedPorts(NetworkTCPV4, &cfg)
+				default:
+					require.Fail(t, "unrecognized network %q", network)
+				}
+				srv, err := New(cfg)
+				require.NoError(t, err)
 
-	t.Run("http", func(t *testing.T) {
-		cfg.MetricsNamespace = "testing_http"
-		var level log.Level
-		require.NoError(t, level.Set("info"))
-		cfg.LogLevel = level
-		srv, err := New(cfg)
-		require.NoError(t, err)
+				errChan := make(chan error, 1)
+				var wg sync.WaitGroup
+				t.Cleanup(wg.Wait)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					errChan <- srv.Run()
+				}()
 
-		errChan := make(chan error, 1)
-		go func() {
-			errChan <- srv.Run()
-		}()
+				switch tc.protocol {
+				case "http":
+					require.NoError(t, srv.httpListener.Close())
+				case "grpc":
+					require.NoError(t, srv.grpcListener.Close())
+				default:
+					require.Fail(t, fmt.Sprintf("unrecognized protocol %q", tc.protocol))
+				}
+				require.NotNil(t, <-errChan)
 
-		require.NoError(t, srv.httpListener.Close())
-		require.NotNil(t, <-errChan)
-
-		// So that address is freed for further tests.
-		srv.GRPC.Stop()
-	})
-
-	t.Run("grpc", func(t *testing.T) {
-		cfg.MetricsNamespace = "testing_grpc"
-		srv, err := New(cfg)
-		require.NoError(t, err)
-
-		errChan := make(chan error, 1)
-		go func() {
-			errChan <- srv.Run()
-		}()
-
-		require.NoError(t, srv.grpcListener.Close())
-		require.NotNil(t, <-errChan)
-	})
+				// So that address is freed for further tests.
+				srv.GRPC.Stop()
+			})
+		}
+	}
 }
 
 // Test to see what the logging of a 500 error looks like
@@ -515,13 +558,14 @@ func TestMiddlewareLogging(t *testing.T) {
 		LogLevel:                      level,
 		DoNotAddDefaultHTTPMiddleware: true,
 		Router:                        &mux.Router{},
+		Registerer:                    prometheus.NewPedanticRegistry(),
 	}
 	setAutoAssignedPorts(DefaultNetwork, &cfg)
 
 	server, err := New(cfg)
 	require.NoError(t, err)
 
-	server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(500)
 	})
 
@@ -560,13 +604,14 @@ func TestTLSServer(t *testing.T) {
 		},
 		MetricsNamespace: "testing_tls",
 		LogLevel:         level,
+		Registerer:       prometheus.NewPedanticRegistry(),
 	}
 	setAutoAssignedPorts(DefaultNetwork, &cfg)
 
 	server, err := New(cfg)
 	require.NoError(t, err)
 
-	server.HTTP.HandleFunc("/testhttps", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/testhttps", func(w http.ResponseWriter, _ *http.Request) {
 		_, err := w.Write([]byte("Hello World!"))
 		require.NoError(t, err)
 	})
@@ -609,14 +654,15 @@ func TestTLSServer(t *testing.T) {
 	expected := []byte("Hello World!")
 	require.Equal(t, expected, body)
 
-	conn, err := grpc.Dial(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	conn, err := grpc.NewClient(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	require.NoError(t, err)
 	defer conn.Close()
 
-	empty := protobuf.Empty{}
+	empty := emptypb.Empty{}
 	grpcClient := NewFakeServerClient(conn)
 	grpcRes, err := grpcClient.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
+	empty.Reset()
 	require.EqualValues(t, &empty, grpcRes)
 }
 
@@ -653,6 +699,7 @@ func TestTLSServerWithInlineCerts(t *testing.T) {
 		},
 		MetricsNamespace: "testing_tls_certs_inline",
 		LogLevel:         level,
+		Registerer:       prometheus.NewPedanticRegistry(),
 	}
 	setAutoAssignedPorts(DefaultNetwork, &cfg)
 
@@ -661,7 +708,7 @@ func TestTLSServerWithInlineCerts(t *testing.T) {
 
 	require.NoError(t, err)
 
-	server.HTTP.HandleFunc("/testhttps", func(w http.ResponseWriter, r *http.Request) {
+	server.HTTP.HandleFunc("/testhttps", func(w http.ResponseWriter, _ *http.Request) {
 		_, err := w.Write([]byte("Hello World!"))
 		require.NoError(t, err)
 	})
@@ -700,15 +747,113 @@ func TestTLSServerWithInlineCerts(t *testing.T) {
 	expected := []byte("Hello World!")
 	require.Equal(t, expected, body)
 
-	conn, err := grpc.Dial(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	conn, err := grpc.NewClient(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	require.NoError(t, err)
 	defer conn.Close()
 
-	empty := protobuf.Empty{}
+	empty := emptypb.Empty{}
 	grpcClient := NewFakeServerClient(conn)
 	grpcRes, err := grpcClient.Succeed(context.Background(), &empty)
 	require.NoError(t, err)
+	empty.Reset()
 	require.EqualValues(t, &empty, grpcRes)
+}
+
+func TestTLSServerWithCurvePreferences(t *testing.T) {
+	var level log.Level
+	require.NoError(t, level.Set("info"))
+
+	certsDir := t.TempDir()
+	cmd := exec.Command("bash", filepath.Join("certs", "genCerts.sh"), certsDir, "1")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	t.Run("valid curve preferences are applied to HTTP and gRPC", func(t *testing.T) {
+		cfg := Config{
+			HTTPTLSConfig: TLSConfig{
+				TLSCertPath: filepath.Join(certsDir, "server.crt"),
+				TLSKeyPath:  filepath.Join(certsDir, "server.key"),
+				ClientAuth:  "RequireAndVerifyClientCert",
+				ClientCAs:   filepath.Join(certsDir, "root.crt"),
+			},
+			GRPCTLSConfig: TLSConfig{
+				TLSCertPath: filepath.Join(certsDir, "server.crt"),
+				TLSKeyPath:  filepath.Join(certsDir, "server.key"),
+				ClientAuth:  "VerifyClientCertIfGiven",
+				ClientCAs:   filepath.Join(certsDir, "root.crt"),
+			},
+			CurvePreferences: "CurveP256,X25519",
+			MetricsNamespace: "testing_tls_curves",
+			LogLevel:         level,
+			Registerer:       prometheus.NewPedanticRegistry(),
+		}
+		setAutoAssignedPorts(DefaultNetwork, &cfg)
+
+		server, err := New(cfg)
+		require.NoError(t, err)
+
+		server.HTTP.HandleFunc("/testhttps", func(w http.ResponseWriter, _ *http.Request) {
+			_, err := w.Write([]byte("Hello World!"))
+			require.NoError(t, err)
+		})
+		RegisterFakeServerServer(server.GRPC, FakeServer{})
+
+		go func() {
+			require.NoError(t, server.Run())
+		}()
+		defer server.Shutdown()
+
+		clientCert, err := tls.LoadX509KeyPair(filepath.Join(certsDir, "client.crt"), filepath.Join(certsDir, "client.key"))
+		require.NoError(t, err)
+
+		caCert, err := os.ReadFile(filepath.Join(certsDir, "root.crt"))
+		require.NoError(t, err)
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		// Client offering only CurveP256, which the server allows.
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true,
+			Certificates:       []tls.Certificate{clientCert},
+			RootCAs:            caCertPool,
+			CurvePreferences:   []tls.CurveID{tls.CurveP256},
+		}
+
+		// HTTP succeeds with an allowed curve.
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}
+		res, err := client.Get(httpsTarget(server, "/testhttps"))
+		require.NoError(t, err)
+		defer res.Body.Close()
+		require.Equal(t, http.StatusOK, res.StatusCode)
+
+		// gRPC succeeds with an allowed curve.
+		conn, err := grpc.NewClient(server.GRPCListenAddr().String(), grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+		require.NoError(t, err)
+		defer conn.Close()
+
+		grpcClient := NewFakeServerClient(conn)
+		_, err = grpcClient.Succeed(context.Background(), &emptypb.Empty{})
+		require.NoError(t, err)
+	})
+
+	t.Run("invalid curve preferences fail at construction", func(t *testing.T) {
+		cfg := Config{
+			HTTPTLSConfig: TLSConfig{
+				TLSCertPath: filepath.Join(certsDir, "server.crt"),
+				TLSKeyPath:  filepath.Join(certsDir, "server.key"),
+			},
+			CurvePreferences: "not-a-curve",
+			MetricsNamespace: "testing_tls_curves_invalid",
+			LogLevel:         level,
+			Registerer:       prometheus.NewPedanticRegistry(),
+		}
+		setAutoAssignedPorts(DefaultNetwork, &cfg)
+
+		_, err := New(cfg)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "not-a-curve")
+	})
 }
 
 type FakeLogger struct {
@@ -753,7 +898,7 @@ func TestLogSourceIPs(t *testing.T) {
 		server, err := New(cfg)
 		require.NoError(t, err)
 
-		server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, r *http.Request) {
+		server.HTTP.HandleFunc("/error500", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(500)
 		})
 
@@ -809,21 +954,26 @@ func TestLogSourceIPs(t *testing.T) {
 }
 
 func TestStopWithDisabledSignalHandling(t *testing.T) {
-	var level log.Level
-	require.NoError(t, level.Set("info"))
-	cfg := Config{
-		LogLevel: level,
-	}
-	setAutoAssignedPorts(DefaultNetwork, &cfg)
+	test := func(t *testing.T, metricsNamespace string, handler SignalHandler) {
+		var level log.Level
+		require.NoError(t, level.Set("info"))
+		cfg := Config{
+			LogLevel:         level,
+			SignalHandler:    handler,
+			MetricsNamespace: metricsNamespace,
+			Registerer:       prometheus.NewPedanticRegistry(),
+		}
+		setAutoAssignedPorts(DefaultNetwork, &cfg)
 
-	var test = func(t *testing.T, metricsNamespace string, handler SignalHandler) {
-		cfg.SignalHandler = handler
-		cfg.MetricsNamespace = metricsNamespace
 		srv, err := New(cfg)
 		require.NoError(t, err)
 
 		errChan := make(chan error, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		t.Cleanup(wg.Wait)
 		go func() {
+			defer wg.Done()
 			errChan <- srv.Run()
 		}()
 
@@ -861,7 +1011,7 @@ func (pc *proxyProtocolConn) Write(b []byte) (int, error) {
 }
 
 func proxyDialer(proxyHeader string) func(context.Context, string, string) (net.Conn, error) {
-	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+	return func(_ context.Context, network string, addr string) (net.Conn, error) {
 		conn, err := net.Dial(network, addr)
 		if err != nil {
 			return nil, err
@@ -949,11 +1099,15 @@ func TestGrpcOverProxyProtocol(t *testing.T) {
 	var cfg Config
 	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
 	cfg.ProxyProtocolEnabled = true
+	// Set this to 0 to have it choose a random port
+	cfg.HTTPListenAddress = "localhost"
+	cfg.GRPCListenAddress = "localhost"
+	cfg.HTTPListenPort = 0
 
 	fakeSourceIP := "1.2.3.4"
 
 	// Custom dialer that sends a PROXY header
-	customDialer := func(ctx context.Context, address string) (net.Conn, error) {
+	customDialer := func(_ context.Context, address string) (net.Conn, error) {
 		conn, err := net.Dial("tcp", address)
 		if err != nil {
 			return nil, err
@@ -980,12 +1134,12 @@ func TestGrpcOverProxyProtocol(t *testing.T) {
 	}()
 	defer server.Shutdown()
 
-	conn, err := grpc.Dial("localhost:9095", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(customDialer))
+	conn, err := grpc.NewClient("localhost:9095", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(customDialer))
 	require.NoError(t, err)
 	defer conn.Close()
 
 	client := NewFakeServerClient(conn)
-	res, err := client.ReturnProxyProtoCallerIP(context.Background(), &protobuf.Empty{})
+	res, err := client.ReturnProxyProtoCallerIP(context.Background(), &emptypb.Empty{})
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	require.Equal(t, fakeSourceIP, res.IP)
@@ -1012,22 +1166,158 @@ func setAutoAssignedPorts(network string, cfg *Config) {
 	cfg.GRPCListenPort = 0
 }
 
+func TestServer_OpenMetricsTextCreatedSamples(t *testing.T) {
+	t.Run("exposition", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			args        []string
+			mediaType   string
+			version     string
+			wantCreated bool
+		}{
+			{
+				name:      "default OpenMetrics",
+				mediaType: "application/openmetrics-text",
+				version:   "1.0.0",
+			},
+			{
+				name:        "enabled OpenMetrics",
+				args:        []string{"-server.enable-open-metrics-text-created-samples=true"},
+				mediaType:   "application/openmetrics-text",
+				version:     "1.0.0",
+				wantCreated: true,
+			},
+			{
+				name:      "default Prometheus",
+				mediaType: "text/plain",
+				version:   "0.0.4",
+			},
+			{
+				name:      "enabled Prometheus",
+				args:      []string{"-server.enable-open-metrics-text-created-samples=true"},
+				mediaType: "text/plain",
+				version:   "0.0.4",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var cfg Config
+				flags := flag.NewFlagSet(t.Name(), flag.ContinueOnError)
+				cfg.RegisterFlags(flags)
+				require.NoError(t, flags.Parse(tc.args))
+				require.NoError(t, cfg.Validate())
+				setAutoAssignedPorts(DefaultNetwork, &cfg)
+				cfg.SignalHandler = dummyHandler{quit: make(chan struct{})}
+
+				reg := prometheus.NewPedanticRegistry()
+				cfg.Registerer, cfg.Gatherer = reg, reg
+				counter := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+					Name: "test_requests_total",
+					Help: "Requests used to test metrics exposition.",
+				})
+				counter.Add(7)
+
+				srv, err := New(cfg)
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					// Shutdown does not close listeners that were never served.
+					assert.NoError(t, srv.httpListener.Close())
+					assert.NoError(t, srv.grpcListener.Close())
+					srv.Shutdown()
+				})
+
+				req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+				req.Header.Set("Accept", tc.mediaType+"; version="+tc.version)
+				resp := httptest.NewRecorder()
+				srv.HTTP.ServeHTTP(resp, req)
+				require.Equal(t, http.StatusOK, resp.Code)
+
+				mediaType, params, err := mime.ParseMediaType(resp.Header().Get("Content-Type"))
+				require.NoError(t, err)
+				assert.Equal(t, tc.mediaType, mediaType)
+				assert.Equal(t, tc.version, params["version"])
+
+				samples := make(map[string]float64)
+				for _, line := range strings.Split(resp.Body.String(), "\n") {
+					fields := strings.Fields(line)
+					if len(fields) == 0 || (fields[0] != "test_requests_total" && fields[0] != "test_requests_created") {
+						continue
+					}
+					require.Len(t, fields, 2)
+					value, err := strconv.ParseFloat(fields[1], 64)
+					require.NoError(t, err)
+					require.NotContains(t, samples, fields[0], "duplicate sample")
+					samples[fields[0]] = value
+				}
+				require.Contains(t, samples, "test_requests_total")
+				assert.Equal(t, 7.0, samples["test_requests_total"])
+				created, hasCreated := samples["test_requests_created"]
+				require.Equal(t, tc.wantCreated, hasCreated, "unexpected presence of test_requests_created")
+				if tc.wantCreated {
+					assert.Greater(t, created, 0.0)
+				}
+			})
+		}
+	})
+
+	t.Run("validation", func(t *testing.T) {
+		for _, tc := range []struct {
+			name                    string
+			registerInstrumentation bool
+			enableCreatedSamples    bool
+			wantErr                 bool
+		}{
+			{name: "both disabled"},
+			{name: "instrumentation only", registerInstrumentation: true},
+			{name: "both enabled", registerInstrumentation: true, enableCreatedSamples: true},
+			{name: "created samples without instrumentation", enableCreatedSamples: true, wantErr: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := Config{
+					RegisterInstrumentation:             tc.registerInstrumentation,
+					EnableOpenMetricsTextCreatedSamples: tc.enableCreatedSamples,
+				}
+				err := cfg.Validate()
+				if tc.wantErr {
+					require.EqualError(t, err, "server.enable-open-metrics-text-created-samples can only be used if server.register-instrumentation is set to true")
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
+	})
+}
+
+func TestPprofCmdlineDisabled(t *testing.T) {
+	var cfg Config
+	flagext.DefaultValues(&cfg)
+	setAutoAssignedPorts("tcp", &cfg)
+	reg := prometheus.NewPedanticRegistry()
+	cfg.Registerer, cfg.Gatherer = reg, reg
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	go func() { require.NoError(t, srv.Run()) }()
+	t.Cleanup(srv.Shutdown)
+
+	// /debug/pprof/cmdline should return 404
+	resp, err := http.Get(httpTarget(srv, "/debug/pprof/cmdline"))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	// Other pprof endpoints should still work
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap"} {
+		resp, err := http.Get(httpTarget(srv, path))
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "expected 200 for %s", path)
+	}
+}
+
 func httpTarget(srv *Server, path string) string {
 	return fmt.Sprintf("http://%s%s", srv.HTTPListenAddr().String(), path)
 }
 
 func httpsTarget(srv *Server, path string) string {
 	return fmt.Sprintf("https://%s%s", srv.HTTPListenAddr().String(), path)
-}
-
-func TestGrpcServerRecvBuffersConfigError(t *testing.T) {
-	var cfg Config
-	cfg.RegisterFlags(flag.NewFlagSet("", flag.ExitOnError))
-	setAutoAssignedPorts(DefaultNetwork, &cfg)
-	cfg.GRPCServerStatsTrackingEnabled = true
-	cfg.GRPCServerRecvBufferPoolsEnabled = true
-	cfg.MetricsNamespace = "testing_grpc_config_conflicts"
-
-	_, err := New(cfg)
-	require.Error(t, err)
 }

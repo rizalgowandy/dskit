@@ -2,12 +2,13 @@ package ring
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"golang.org/x/exp/slices"
 
 	"github.com/grafana/dskit/kv/codec"
 	"github.com/grafana/dskit/kv/memberlist"
@@ -68,32 +69,6 @@ func NewPartitionRingDesc() *PartitionRingDesc {
 	}
 }
 
-// tokens returns a sort list of tokens registered by all partitions.
-func (m *PartitionRingDesc) tokens() Tokens {
-	allTokens := make(Tokens, 0, len(m.Partitions)*optimalTokensPerInstance)
-
-	for _, partition := range m.Partitions {
-		allTokens = append(allTokens, partition.Tokens...)
-	}
-
-	slices.Sort(allTokens)
-	return allTokens
-}
-
-// partitionByToken returns a map where they key is a registered token and the value is ID of the partition
-// that registered that token.
-func (m *PartitionRingDesc) partitionByToken() map[Token]int32 {
-	out := make(map[Token]int32, len(m.Partitions)*optimalTokensPerInstance)
-
-	for partitionID, partition := range m.Partitions {
-		for _, token := range partition.Tokens {
-			out[Token(token)] = partitionID
-		}
-	}
-
-	return out
-}
-
 // ownersByPartition returns a map where the key is the partition ID and the value is a list of owner IDs.
 func (m *PartitionRingDesc) ownersByPartition() map[int32][]string {
 	out := make(map[int32][]string, len(m.Partitions))
@@ -138,6 +113,16 @@ func (m *PartitionRingDesc) activePartitionsCount() int {
 	return count
 }
 
+func (m *PartitionRingDesc) maxPartitionID() int32 {
+	var max int32 = -1
+	for id := range m.Partitions {
+		if id > max {
+			max = id
+		}
+	}
+	return max
+}
+
 // WithPartitions returns a new PartitionRingDesc with only the specified partitions and their owners included.
 func (m *PartitionRingDesc) WithPartitions(partitions map[int32]struct{}) PartitionRingDesc {
 	newPartitions := make(map[int32]PartitionDesc, len(partitions))
@@ -170,7 +155,19 @@ func (m *PartitionRingDesc) AddPartition(id int32, state PartitionState, now tim
 
 	m.Partitions[id] = PartitionDesc{
 		Id:             id,
+		TokenScheme:    PartitionTokensStored,
 		Tokens:         spreadMinimizing.GenerateTokens(optimalTokensPerInstance, nil),
+		State:          state,
+		StateTimestamp: now.Unix(),
+	}
+}
+
+// AddPartitionWithDerivedTokens adds a partition using PartitionTokensSmt512.
+func (m *PartitionRingDesc) AddPartitionWithDerivedTokens(id int32, state PartitionState, now time.Time) {
+	m.Partitions[id] = PartitionDesc{
+		Id:             id,
+		TokenScheme:    PartitionTokensSmt512,
+		Tokens:         nil, // Tokens will be derived by readers
 		State:          state,
 		StateTimestamp: now.Unix(),
 	}
@@ -178,18 +175,40 @@ func (m *PartitionRingDesc) AddPartition(id int32, state PartitionState, now tim
 
 // UpdatePartitionState changes the state of a partition. Returns true if the state was changed,
 // or false if the update was a no-op.
-func (m *PartitionRingDesc) UpdatePartitionState(id int32, state PartitionState, now time.Time) bool {
+func (m *PartitionRingDesc) UpdatePartitionState(id int32, state PartitionState, now time.Time) (bool, error) {
+	d, ok := m.Partitions[id]
+	if !ok {
+		return false, nil
+	}
+
+	if d.State == state {
+		return false, nil
+	}
+
+	if d.StateChangeLocked {
+		return false, ErrPartitionStateChangeLocked
+	}
+
+	d.State = state
+	d.StateTimestamp = now.Unix()
+	m.Partitions[id] = d
+	return true, nil
+}
+
+// UpdatePartitionStateChangeLock changes the state change lock of a partition. Returns true if the lock was changed,
+// or false if the update was a no-op.
+func (m *PartitionRingDesc) UpdatePartitionStateChangeLock(id int32, locked bool, now time.Time) bool {
 	d, ok := m.Partitions[id]
 	if !ok {
 		return false
 	}
 
-	if d.State == state {
+	if d.StateChangeLocked == locked {
 		return false
 	}
 
-	d.State = state
-	d.StateTimestamp = now.Unix()
+	d.StateChangeLocked = locked
+	d.StateChangeLockedTimestamp = now.Unix()
 	m.Partitions[id] = d
 	return true
 }
@@ -271,6 +290,9 @@ func (m *PartitionRingDesc) PartitionOwnersCountUpdatedBefore(partitionID int32,
 }
 
 // Merge implements memberlist.Mergeable.
+//
+// Timestamps more than maxFutureTimestampSkew ahead of the local clock are handled
+// as described in Desc.Merge.
 func (m *PartitionRingDesc) Merge(mergeable memberlist.Mergeable, localCAS bool) (memberlist.Mergeable, error) {
 	return m.mergeWithTime(mergeable, localCAS, time.Now())
 }
@@ -290,6 +312,7 @@ func (m *PartitionRingDesc) mergeWithTime(mergeable memberlist.Mergeable, localC
 	}
 
 	change := NewPartitionRingDesc()
+	timestampLimit := futureTimestampLimit(now)
 
 	// Handle partitions.
 	for id, otherPart := range other.Partitions {
@@ -297,24 +320,41 @@ func (m *PartitionRingDesc) mergeWithTime(mergeable memberlist.Mergeable, localC
 
 		thisPart, exists := m.Partitions[id]
 		if !exists {
+			if otherPart.StateTimestamp > timestampLimit {
+				// Written by a node with a clock too far ahead. Accepting it would block all later updates.
+				// A state change lock timestamp too far ahead is kept, because any valid one replaces it.
+				continue
+			}
+
 			changed = true
 			thisPart = otherPart
 		} else {
-			// We don't merge changes to partition ID and tokens because we expect them to be immutable.
+			// We don't merge changes to partition ID, tokens and token scheme because we expect them to be immutable.
 			//
 			// If in the future we'll change the tokens generation algorithm and we'll have to handle migration to
-			// a different set of tokens then we'll add the support. For example, we could add "token generation version"
-			// to PartitionDesc and then preserve tokens generated by latest version only, or a timestamp for tokens
-			// update too.
+			// a different set of tokens then we'll add the support. For example, we could add a new token scheme
+			// and preserve tokens generated by the latest scheme only, or a timestamp for tokens update too.
+
+			// Timestamps from a node with a clock too far ahead are ignored when incoming,
+			// and replaceable by any valid incoming timestamp when local.
+			thisStateTimestamp := localMergeTimestamp(thisPart.StateTimestamp, timestampLimit)
+			thisStateChangeLockedTimestamp := localMergeTimestamp(thisPart.StateChangeLockedTimestamp, timestampLimit)
 
 			// In case the timestamp is equal we give priority to the deleted state.
 			// Reason is that timestamp has second precision, so we cover the case an
 			// update and subsequent deletion occur within the same second.
-			if otherPart.StateTimestamp > thisPart.StateTimestamp || (otherPart.StateTimestamp == thisPart.StateTimestamp && otherPart.State == PartitionDeleted && thisPart.State != PartitionDeleted) {
+			if otherPart.StateTimestamp <= timestampLimit && (otherPart.StateTimestamp > thisStateTimestamp || (otherPart.StateTimestamp == thisStateTimestamp && otherPart.State == PartitionDeleted && thisPart.State != PartitionDeleted)) {
 				changed = true
 
 				thisPart.State = otherPart.State
 				thisPart.StateTimestamp = otherPart.StateTimestamp
+			}
+
+			if otherPart.StateChangeLockedTimestamp <= timestampLimit && otherPart.StateChangeLockedTimestamp > thisStateChangeLockedTimestamp {
+				changed = true
+
+				thisPart.StateChangeLocked = otherPart.StateChangeLocked
+				thisPart.StateChangeLockedTimestamp = otherPart.StateChangeLockedTimestamp
 			}
 		}
 
@@ -340,12 +380,18 @@ func (m *PartitionRingDesc) mergeWithTime(mergeable memberlist.Mergeable, localC
 
 	// Now let's handle owners.
 	for id, otherOwner := range other.Owners {
+		if otherOwner.UpdatedTimestamp > timestampLimit {
+			// Written by a node with a clock too far ahead. Accepting it would block all later updates.
+			continue
+		}
+
 		thisOwner := m.Owners[id]
+		thisUpdatedTimestamp := localMergeTimestamp(thisOwner.UpdatedTimestamp, timestampLimit)
 
 		// In case the timestamp is equal we give priority to the deleted state.
 		// Reason is that timestamp has second precision, so we cover the case an
 		// update and subsequent deletion occur within the same second.
-		if otherOwner.UpdatedTimestamp > thisOwner.UpdatedTimestamp || (otherOwner.UpdatedTimestamp == thisOwner.UpdatedTimestamp && otherOwner.State == OwnerDeleted && thisOwner.State != OwnerDeleted) {
+		if otherOwner.UpdatedTimestamp > thisUpdatedTimestamp || (otherOwner.UpdatedTimestamp == thisUpdatedTimestamp && otherOwner.State == OwnerDeleted && thisOwner.State != OwnerDeleted) {
 			m.Owners[id] = otherOwner
 			change.Owners[id] = otherOwner
 		}
@@ -375,7 +421,7 @@ func (m *PartitionRingDesc) mergeWithTime(mergeable memberlist.Mergeable, localC
 
 // MergeContent implements memberlist.Mergeable.
 func (m *PartitionRingDesc) MergeContent() []string {
-	result := make([]string, len(m.Partitions)+len(m.Owners))
+	result := make([]string, 0, len(m.Partitions)+len(m.Owners))
 
 	// We're assuming that partition IDs and instance IDs are not colliding (ie. no instance is called "1").
 	for pid := range m.Partitions {
@@ -415,18 +461,21 @@ func (m *PartitionRingDesc) RemoveTombstones(limit time.Time) (total, removed in
 	return
 }
 
-// Clone implements memberlist.Mergeable.
+// Clone copies the ring description and its maps. Partition tokens remain shared
+// and must be treated as immutable.
 func (m *PartitionRingDesc) Clone() memberlist.Mergeable {
-	clone := proto.Clone(m).(*PartitionRingDesc)
-
-	// Ensure empty maps are preserved (easier to compare with a deep equal in tests).
-	if m.Partitions != nil && clone.Partitions == nil {
-		clone.Partitions = map[int32]PartitionDesc{}
+	// Non-nullable protobuf map values already share their token slices; typed
+	// copies preserve that ownership without reflection on every memberlist read.
+	clone := &PartitionRingDesc{}
+	// Size by live entries so removed partitions and owners don't retain capacity.
+	if m.Partitions != nil {
+		clone.Partitions = make(map[int32]PartitionDesc, len(m.Partitions))
+		maps.Copy(clone.Partitions, m.Partitions)
 	}
-	if m.Owners != nil && clone.Owners == nil {
-		clone.Owners = map[string]OwnerDesc{}
+	if m.Owners != nil {
+		clone.Owners = make(map[string]OwnerDesc, len(m.Owners))
+		maps.Copy(clone.Owners, m.Owners)
 	}
-
 	return clone
 }
 
@@ -457,4 +506,9 @@ func (m *PartitionDesc) Clone() PartitionDesc {
 // CleanName returns the PartitionState name without the "Partition" prefix.
 func (s PartitionState) CleanName() string {
 	return strings.TrimPrefix(s.String(), "Partition")
+}
+
+// CleanName returns the PartitionTokenScheme name without the "PartitionTokens" prefix.
+func (s PartitionTokenScheme) CleanName() string {
+	return strings.TrimPrefix(s.String(), "PartitionTokens")
 }

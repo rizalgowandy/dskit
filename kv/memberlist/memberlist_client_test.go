@@ -3,21 +3,25 @@ package memberlist
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"net"
-	"reflect"
+	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/hashicorp/memberlist"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -26,6 +30,7 @@ import (
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv/codec"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/test"
 )
 
 const ACTIVE = 1
@@ -131,6 +136,16 @@ func (d *data) getAllTokens() []uint32 {
 	}
 
 	sort.Sort(sortableUint32(out))
+	return out
+}
+
+// getAllMembers returns a sorted list of member names.
+func (d *data) getAllMembers() []string {
+	out := make([]string, 0, len(d.Members))
+	for k := range d.Members {
+		out = append(out, k)
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -252,10 +267,117 @@ func getLocalhostAddrs() []string {
 	return []string{localhostIP}
 }
 
+func checkMemberlistEntry(t *testing.T, kv *Client, key string, duration time.Duration) {
+	test.Poll(t, duration, nil, func() interface{} {
+		val := get(t, kv, key)
+		if val != nil {
+			return fmt.Errorf("expected nil, got: %v", val)
+		}
+		return nil
+	})
+}
+
+func TestKVConfig_Validate(t *testing.T) {
+	testCases := map[string]struct {
+		modify  func(*KVConfig)
+		wantErr string
+	}{
+		"default config is valid": {
+			modify:  func(_ *KVConfig) {},
+			wantErr: "",
+		},
+		"empty compression algorithm is valid": {
+			modify:  func(cfg *KVConfig) { cfg.CompressionAlgorithm = "" },
+			wantErr: "",
+		},
+		"compression algorithm lzw is valid": {
+			modify:  func(cfg *KVConfig) { cfg.CompressionAlgorithm = "lzw" },
+			wantErr: "",
+		},
+		"compression algorithm snappy is valid": {
+			modify:  func(cfg *KVConfig) { cfg.CompressionAlgorithm = "snappy" },
+			wantErr: "",
+		},
+		"unsupported compression algorithm is rejected": {
+			modify:  func(cfg *KVConfig) { cfg.CompressionAlgorithm = "gzip" },
+			wantErr: `memberlist compression algorithm "gzip" is not supported`,
+		},
+		"compression algorithm is ignored when compression is disabled": {
+			modify: func(cfg *KVConfig) {
+				cfg.EnableCompression = false
+				cfg.CompressionAlgorithm = "snappy"
+			},
+			wantErr: "",
+		},
+		"compression algorithm set with enable is valid": {
+			modify: func(cfg *KVConfig) {
+				cfg.EnableCompression = true
+				cfg.CompressionAlgorithm = "snappy"
+			},
+			wantErr: "",
+		},
+		"zero received messages queue size is rejected": {
+			modify:  func(cfg *KVConfig) { cfg.ReceivedMessagesQueueSize = 0 },
+			wantErr: "memberlist received messages queue size must be greater than 0",
+		},
+		"negative received messages queue size is rejected": {
+			modify:  func(cfg *KVConfig) { cfg.ReceivedMessagesQueueSize = -1 },
+			wantErr: "memberlist received messages queue size must be greater than 0",
+		},
+		"zero processed messages queue size is rejected": {
+			modify:  func(cfg *KVConfig) { cfg.ProcessedMessagesQueueSize = 0 },
+			wantErr: "memberlist processed messages queue size must be greater than 0",
+		},
+		"negative processed messages queue size is rejected": {
+			modify:  func(cfg *KVConfig) { cfg.ProcessedMessagesQueueSize = -1 },
+			wantErr: "memberlist processed messages queue size must be greater than 0",
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var cfg KVConfig
+			flagext.DefaultValues(&cfg)
+			tc.modify(&cfg)
+
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestKV_BuildMemberlistConfig_CompressionAlgorithm(t *testing.T) {
+	testCases := map[string]struct {
+		configured string
+		expected   memberlist.CompressionAlgorithm
+	}{
+		"empty propagates literally": {configured: "", expected: memberlist.CompressionAlgorithm("")},
+		"lzw propagates":             {configured: "lzw", expected: memberlist.CompressionAlgorithmLZW},
+		"snappy propagates":          {configured: "snappy", expected: memberlist.CompressionAlgorithmSnappy},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var cfg KVConfig
+			flagext.DefaultValues(&cfg)
+			cfg.TCPTransport = TCPTransportConfig{BindAddrs: getLocalhostAddrs()}
+			cfg.CompressionAlgorithm = tc.configured
+
+			mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+			mlCfg, err := mkv.buildMemberlistConfig()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, mlCfg.Transport.Shutdown()) })
+			require.Equal(t, tc.expected, mlCfg.CompressionAlgorithm)
+		})
+	}
+}
+
 func TestBasicGetAndCas(t *testing.T) {
 	c := dataCodec{}
 
-	name := "Ing 1"
 	var cfg KVConfig
 	flagext.DefaultValues(&cfg)
 	cfg.TCPTransport = TCPTransportConfig{
@@ -263,7 +385,7 @@ func TestBasicGetAndCas(t *testing.T) {
 	}
 	cfg.Codecs = []codec.Codec{c}
 
-	mkv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
 
@@ -278,6 +400,7 @@ func TestBasicGetAndCas(t *testing.T) {
 	}
 
 	// Create member in PENDING state, with some tokens
+	name := "Ing 1"
 	err = cas(kv, key, updateFn(name))
 	require.NoError(t, err)
 
@@ -325,7 +448,7 @@ func withFixtures(t *testing.T, testFN func(t *testing.T, kv *Client)) {
 	}
 	cfg.Codecs = []codec.Codec{c}
 
-	mkv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
 
@@ -339,7 +462,7 @@ func TestCASNoOutput(t *testing.T) {
 	withFixtures(t, func(t *testing.T, kv *Client) {
 		// should succeed with single call
 		calls := 0
-		err := cas(kv, key, func(d *data) (*data, bool, error) {
+		err := cas(kv, key, func(*data) (*data, bool, error) {
 			calls++
 			return nil, true, nil
 		})
@@ -352,7 +475,7 @@ func TestCASNoOutput(t *testing.T) {
 func TestCASErrorNoRetry(t *testing.T) {
 	withFixtures(t, func(t *testing.T, kv *Client) {
 		calls := 0
-		err := casWithErr(context.Background(), kv, key, func(d *data) (*data, bool, error) {
+		err := casWithErr(context.Background(), kv, key, func(*data) (*data, bool, error) {
 			calls++
 			return nil, false, errors.New("don't worry, be happy")
 		})
@@ -364,7 +487,7 @@ func TestCASErrorNoRetry(t *testing.T) {
 func TestCASErrorWithRetries(t *testing.T) {
 	withFixtures(t, func(t *testing.T, kv *Client) {
 		calls := 0
-		err := casWithErr(context.Background(), kv, key, func(d *data) (*data, bool, error) {
+		err := casWithErr(context.Background(), kv, key, func(*data) (*data, bool, error) {
 			calls++
 			return nil, true, errors.New("don't worry, be happy")
 		})
@@ -437,7 +560,7 @@ func TestCASNoChangeShortTimeout(t *testing.T) {
 
 func TestCASFailedBecauseOfVersionChanges(t *testing.T) {
 	withFixtures(t, func(t *testing.T, kv *Client) {
-		err := cas(kv, key, func(in *data) (*data, bool, error) {
+		err := cas(kv, key, func(*data) (*data, bool, error) {
 			return &data{Members: map[string]member{"nonempty": {Timestamp: time.Now().Unix()}}}, true, nil
 		})
 		require.NoError(t, err)
@@ -464,9 +587,50 @@ func TestCASFailedBecauseOfVersionChanges(t *testing.T) {
 			return d, true, nil
 		})
 
-		require.EqualError(t, err, "failed to CAS-update key test: too many retries")
+		require.EqualError(t, err, "failed to CAS-update key test: too many retries: version mismatch")
 		require.Equal(t, maxCasRetries, calls)
 	})
+}
+
+func TestCASRetryBackoff(t *testing.T) {
+	c := dataCodec{}
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport = TCPTransportConfig{BindAddrs: getLocalhostAddrs()}
+	cfg.Codecs = []codec.Codec{c}
+	cfg.CasRetryMinBackoff = 5 * time.Millisecond
+	cfg.CasRetryMaxBackoff = 20 * time.Millisecond
+
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
+	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
+
+	kv, err := NewClient(mkv, c)
+	require.NoError(t, err)
+
+	require.NoError(t, cas(kv, key, func(*data) (*data, bool, error) {
+		return &data{Members: map[string]member{"nonempty": {Timestamp: time.Now().Unix()}}}, true, nil
+	}))
+
+	calls := 0
+	start := time.Now()
+	err = casWithErr(context.Background(), kv, key, func(d *data) (*data, bool, error) {
+		calls++
+		require.NoError(t, cas(kv, key, func(d *data) (*data, bool, error) {
+			d.Members[fmt.Sprintf("%d", calls)] = member{Timestamp: time.Now().Unix()}
+			return d, true, nil
+		}))
+		d.Members["world"] = member{Timestamp: time.Now().Unix()}
+		return d, true, nil
+	})
+	elapsed := time.Since(start)
+
+	require.EqualError(t, err, "failed to CAS-update key test: too many retries: version mismatch")
+	require.Equal(t, maxCasRetries, calls)
+	// maxCasRetries-1 delays of at least MinBackoff each — a lower bound that only
+	// holds if the delay actually ran (it wouldn't with MinBackoff=0).
+	require.GreaterOrEqual(t, elapsed, time.Duration(maxCasRetries-1)*cfg.CasRetryMinBackoff)
 }
 
 func TestMultipleCAS(t *testing.T) {
@@ -481,7 +645,7 @@ func TestMultipleCAS(t *testing.T) {
 	}
 	cfg.Codecs = []codec.Codec{c}
 
-	mkv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	mkv.maxCasRetries = 20
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
@@ -565,6 +729,7 @@ func defaultKVConfig(i int) KVConfig {
 	cfg.GossipInterval = 100 * time.Millisecond
 	cfg.GossipNodes = 10
 	cfg.PushPullInterval = 5 * time.Second
+	cfg.ObsoleteEntriesTimeout = 5 * time.Second
 
 	cfg.TCPTransport = TCPTransportConfig{
 		BindAddrs: getLocalhostAddrs(),
@@ -572,6 +737,116 @@ func defaultKVConfig(i int) KVConfig {
 	}
 
 	return cfg
+}
+
+func TestDelete(t *testing.T) {
+	t.Parallel()
+
+	c := dataCodec{}
+
+	reg := prometheus.NewRegistry()
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport = TCPTransportConfig{
+		BindAddrs: getLocalhostAddrs(),
+		BindPort:  0, // randomize ports
+	}
+	cfg.GossipNodes = 1
+	cfg.GossipInterval = 100 * time.Millisecond
+	cfg.ObsoleteEntriesTimeout = 500 * time.Millisecond
+	cfg.ClusterLabelVerificationDisabled = true
+	cfg.Codecs = []codec.Codec{c}
+
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, reg)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
+	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
+
+	kv, err := NewClient(mkv, c)
+	require.NoError(t, err)
+
+	const key = "test"
+
+	val := get(t, kv, key)
+	if val != nil {
+		t.Error("Expected nil, got:", val)
+	}
+
+	err = cas(kv, key, updateFn("test"))
+	require.NoError(t, err)
+
+	err = kv.Delete(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Failed to delete key %s: %v", key, err)
+	}
+
+	checkMemberlistEntry(t, kv, key, 2*time.Second)
+
+	// Validate that there are no encoding errors during the Delete flow.
+	assert.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+			# HELP memberlist_client_messages_to_broadcast_dropped_total Number of broadcast messages intended to be sent but were dropped due to encoding errors or for being too big
+			# TYPE memberlist_client_messages_to_broadcast_dropped_total counter
+			memberlist_client_messages_to_broadcast_dropped_total 0
+	`), "memberlist_client_messages_to_broadcast_dropped_total"))
+}
+
+func TestDeleteMultipleClients(t *testing.T) {
+
+	const deleteTime = 1 * time.Second
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport = TCPTransportConfig{
+		BindAddrs: getLocalhostAddrs(),
+		BindPort:  0, // randomize
+	}
+
+	cfg.Codecs = []codec.Codec{
+		dataCodec{},
+	}
+
+	cfg.GossipNodes = 1
+	cfg.GossipInterval = 100 * time.Millisecond
+	cfg.PushPullInterval = deleteTime
+	cfg.ObsoleteEntriesTimeout = deleteTime
+
+	mkv1 := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
+	defer services.StopAndAwaitTerminated(context.Background(), mkv1) //nolint:errcheck
+
+	kv1, err := NewClient(mkv1, dataCodec{})
+	require.NoError(t, err)
+
+	const memberKey = "entry"
+
+	// Calling updateFn once creates single entry, in JOINING state.
+	err = cas(kv1, key, updateFn(memberKey))
+	require.NoError(t, err)
+
+	// We will read values from second KV, which will join the first one
+	cfg.JoinMembers = []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(mkv1.GetListeningPort()))}
+
+	mkv2 := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv2))
+	defer services.StopAndAwaitTerminated(context.Background(), mkv2) //nolint:errcheck
+
+	// While waiting for mkv2 to start, we can already create a client for it.
+	// Any client operations will block until mkv2 transitioned to Running state.
+	kv2, err := NewClient(mkv2, dataCodec{})
+	require.NoError(t, err)
+
+	val, err := kv2.Get(context.Background(), key)
+	require.NoError(t, err)
+	require.NotNil(t, val)
+
+	err = kv1.Delete(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Failed to delete key %s: %v", key, err)
+	}
+
+	// wait for the obselete entries to be removed.
+	checkMemberlistEntry(t, kv1, key, 10*deleteTime)
+	checkMemberlistEntry(t, kv2, key, 10*deleteTime)
 }
 
 func TestMultipleClients(t *testing.T) {
@@ -590,12 +865,16 @@ func TestMultipleClientsWithMixedLabelsAndExpectFailure(t *testing.T) {
 	// 1) ""
 	// 2) "label1"
 	// 3) "label2"
+	// 4) "label3"
+	// 5) "label4"
 	//
 	// We expect that it won't be possible to build a memberlist cluster with mixed labels.
 	var membersLabel = []string{
 		"",
 		"label1",
 		"label2",
+		"label3",
+		"label4",
 	}
 
 	configGen := func(i int) KVConfig {
@@ -609,7 +888,7 @@ func TestMultipleClientsWithMixedLabelsAndExpectFailure(t *testing.T) {
 
 	err := testMultipleClientsWithConfigGenerator(t, len(membersLabel), configGen)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), fmt.Sprintf("expected to see at least %d updates, got", len(membersLabel)))
+	require.Contains(t, err.Error(), "expected to see at least 2 members, got 1")
 }
 
 func TestMultipleClientsWithMixedLabelsAndClusterLabelVerificationDisabled(t *testing.T) {
@@ -649,7 +928,6 @@ func TestMultipleClientsWithSameLabelWithClusterLabelVerification(t *testing.T) 
 		cfg := defaultKVConfig(i)
 
 		cfg.ClusterLabel = label
-
 		return cfg
 	}
 
@@ -658,6 +936,8 @@ func TestMultipleClientsWithSameLabelWithClusterLabelVerification(t *testing.T) 
 }
 
 func testMultipleClientsWithConfigGenerator(t *testing.T, members int, configGen func(memberId int) KVConfig) error {
+	t.Helper()
+
 	c := dataCodec{}
 	const key = "ring"
 	var clients []*Client
@@ -687,7 +967,7 @@ func testMultipleClientsWithConfigGenerator(t *testing.T, members int, configGen
 		cfg := configGen(i)
 		cfg.Codecs = []codec.Codec{c}
 
-		mkv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+		mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 		require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
 
 		kv, err := NewClient(mkv, c)
@@ -718,12 +998,11 @@ func testMultipleClientsWithConfigGenerator(t *testing.T, members int, configGen
 
 	startTime := time.Now()
 	firstKv := clients[0]
-	ctx, cancel := context.WithTimeout(context.Background(), casInterval*3/2) // Watch for 1.5 cas intervals.
-	updates := 0
+	ctx, cancel := context.WithTimeout(context.Background(), casInterval*3) // Watch for 3x cas intervals.
+	joinedMembers := 0
 	firstKv.WatchKey(ctx, key, func(in interface{}) bool {
-		updates++
-
 		r := in.(*data)
+		joinedMembers = len(r.Members)
 
 		minTimestamp, maxTimestamp, avgTimestamp := getTimestamps(r.Members)
 
@@ -736,12 +1015,9 @@ func testMultipleClientsWithConfigGenerator(t *testing.T, members int, configGen
 	})
 	cancel() // make linter happy
 
-	t.Logf("Ring updates observed: %d", updates)
-
-	if updates < members {
-		// in general, at least one update from each node. (although that's not necessarily true...
-		// but typically we get more updates than that anyway)
-		return fmt.Errorf("expected to see at least %d updates, got %d", members, updates)
+	if joinedMembers <= 1 {
+		// expect at least 2 members. Otherwise, this means that the ring has failed to sync.
+		return fmt.Errorf("expected to see at least 2 members, got %d", joinedMembers)
 	}
 
 	if err := getClientErr(); err != nil {
@@ -751,47 +1027,69 @@ func testMultipleClientsWithConfigGenerator(t *testing.T, members int, configGen
 	// Let's check all the clients to see if they have relatively up-to-date information
 	// All of them should at least have all the clients
 	// And same tokens.
-	allTokens := []uint32(nil)
+	check := func() error {
+		allTokens := []uint32(nil)
 
-	for i := 0; i < members; i++ {
-		kv := clients[i]
+		for i := 0; i < members; i++ {
+			kv := clients[i]
 
-		r := getData(t, kv, key)
-		t.Logf("KV %d: number of known members: %d\n", i, len(r.Members))
-		if len(r.Members) != members {
-			return fmt.Errorf("Member %d has only %d members in the ring", i, len(r.Members))
-		}
-
-		minTimestamp, maxTimestamp, avgTimestamp := getTimestamps(r.Members)
-		for n, ing := range r.Members {
-			if ing.State != ACTIVE {
-				return fmt.Errorf("Member %d: invalid state of member %s in the ring: %v ", i, n, ing.State)
-			}
-		}
-		now := time.Now()
-		t.Logf("Member %d: oldest: %v, avg: %v, youngest: %v", i,
-			now.Sub(time.Unix(minTimestamp, 0)).String(),
-			now.Sub(time.Unix(avgTimestamp, 0)).String(),
-			now.Sub(time.Unix(maxTimestamp, 0)).String())
-
-		tokens := r.getAllTokens()
-		if allTokens == nil {
-			allTokens = tokens
-			t.Logf("Found tokens: %d", len(allTokens))
-		} else {
-			if len(allTokens) != len(tokens) {
-				return fmt.Errorf("Member %d: Expected %d tokens, got %d", i, len(allTokens), len(tokens))
+			r := getData(t, kv, key)
+			t.Logf("KV %d: number of known members: %d\n", i, len(r.Members))
+			if len(r.Members) != members {
+				return fmt.Errorf("Member %d has only %d members in the ring", i, len(r.Members))
 			}
 
-			for ix, tok := range allTokens {
-				if tok != tokens[ix] {
-					return fmt.Errorf("Member %d: Tokens at position %d differ: %v, %v", i, ix, tok, tokens[ix])
+			minTimestamp, maxTimestamp, avgTimestamp := getTimestamps(r.Members)
+			for n, ing := range r.Members {
+				if ing.State != ACTIVE {
+					stateStr := "UNKNOWN"
+					switch ing.State {
+					case JOINING:
+						stateStr = "JOINING"
+					case LEFT:
+						stateStr = "LEFT"
+					}
+					return fmt.Errorf("Member %d: invalid state of member %s in the ring: %s (%v) ", i, n, stateStr, ing.State)
+				}
+			}
+			now := time.Now()
+			t.Logf("Member %d: oldest: %v, avg: %v, youngest: %v", i,
+				now.Sub(time.Unix(minTimestamp, 0)).String(),
+				now.Sub(time.Unix(avgTimestamp, 0)).String(),
+				now.Sub(time.Unix(maxTimestamp, 0)).String())
+
+			tokens := r.getAllTokens()
+			if allTokens == nil {
+				allTokens = tokens
+				t.Logf("Found tokens: %d", len(allTokens))
+			} else {
+				if len(allTokens) != len(tokens) {
+					return fmt.Errorf("Member %d: Expected %d tokens, got %d", i, len(allTokens), len(tokens))
+				}
+
+				for ix, tok := range allTokens {
+					if tok != tokens[ix] {
+						return fmt.Errorf("Member %d: Tokens at position %d differ: %v, %v", i, ix, tok, tokens[ix])
+					}
 				}
 			}
 		}
+
+		return getClientErr()
 	}
 
-	return getClientErr()
+	// Try this for ~10 seconds. memberlist is eventually consistent, so we may need to wait a bit, especially with `-race`.
+	for timeout := time.After(10 * time.Second); ; {
+		select {
+		case <-timeout:
+			return check() // return last error
+		default:
+			if err := check(); err == nil {
+				return nil // it passed
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 func TestJoinMembersWithRetryBackoff(t *testing.T) {
@@ -937,7 +1235,7 @@ func TestJoinMembersWithRetryBackoff(t *testing.T) {
 	}
 }
 
-func TestMemberlistFailsToJoin(t *testing.T) {
+func TestMemberlist_AbortIfJoinFailsAtStartup(t *testing.T) {
 	c := dataCodec{}
 
 	ports, err := getFreePorts(1)
@@ -959,7 +1257,7 @@ func TestMemberlistFailsToJoin(t *testing.T) {
 
 	cfg.Codecs = []codec.Codec{c}
 
-	mkv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
 
 	ctxTimeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -969,7 +1267,134 @@ func TestMemberlistFailsToJoin(t *testing.T) {
 	_ = mkv.AwaitTerminated(ctxTimeout)
 
 	// We verify service state here.
-	require.Equal(t, mkv.FailureCase(), errFailedToJoinCluster)
+	require.Equal(t, errFailedToJoinCluster, mkv.FailureCase())
+}
+
+func TestMemberlist_AbortIfFastJoinFailsAtStartup(t *testing.T) {
+	t.Run("default config with 1 min required node", func(t *testing.T) {
+		c := dataCodec{}
+
+		ports, err := getFreePorts(1)
+		require.NoError(t, err)
+
+		var cfg KVConfig
+		flagext.DefaultValues(&cfg)
+		cfg.MinJoinBackoff = 100 * time.Millisecond
+		cfg.MaxJoinBackoff = 100 * time.Millisecond
+		cfg.MaxJoinRetries = 2
+		cfg.AbortIfFastJoinFails = true
+		cfg.JoinMembers = []string{net.JoinHostPort(getLocalhostAddr(), strconv.Itoa(ports[0]))}
+		cfg.Codecs = []codec.Codec{c}
+
+		cfg.TCPTransport = TCPTransportConfig{
+			BindAddrs: getLocalhostAddrs(),
+			BindPort:  0,
+		}
+
+		mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+
+		// We expect the service to fail when starting because no node can be reached.
+		err = services.StartAndAwaitRunning(context.Background(), mkv)
+		require.ErrorContains(t, err, "fast-join failed to reach minimum required seed nodes: joined 0, required 1")
+	})
+
+	t.Run("custom config with 2 min required nodes but only 1 reachable", func(t *testing.T) {
+		c := dataCodec{}
+
+		// Start a first KV instance that will be reachable.
+		var cfg1 KVConfig
+		flagext.DefaultValues(&cfg1)
+		cfg1.Codecs = []codec.Codec{c}
+		cfg1.TCPTransport = TCPTransportConfig{
+			BindAddrs: getLocalhostAddrs(),
+			BindPort:  0,
+		}
+
+		mkv1 := NewKV(cfg1, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+		require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
+		defer services.StopAndAwaitTerminated(context.Background(), mkv1) //nolint:errcheck
+
+		// Start a second KV instance that requires 2 nodes but can only reach 1.
+		var cfg2 KVConfig
+		flagext.DefaultValues(&cfg2)
+		cfg2.MinJoinBackoff = 100 * time.Millisecond
+		cfg2.MaxJoinBackoff = 100 * time.Millisecond
+		cfg2.MaxJoinRetries = 2
+		cfg2.AbortIfFastJoinFails = true
+		cfg2.AbortIfFastJoinFailsMinNodes = 2
+		cfg2.JoinMembers = []string{net.JoinHostPort(getLocalhostAddr(), strconv.Itoa(mkv1.GetListeningPort()))}
+		cfg2.Codecs = []codec.Codec{c}
+
+		cfg2.TCPTransport = TCPTransportConfig{
+			BindAddrs: getLocalhostAddrs(),
+			BindPort:  0,
+		}
+
+		mkv2 := NewKV(cfg2, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+
+		// We expect the service to fail when starting because only 1 node was joined but 2 are required.
+		err := services.StartAndAwaitRunning(context.Background(), mkv2)
+		require.ErrorContains(t, err, "fast-join failed to reach minimum required seed nodes: joined 1, required 2")
+	})
+}
+
+func TestMemberlist_discoverMembersWithRetries(t *testing.T) {
+	var (
+		cfg         KVConfig
+		errMocked   = errors.New("mocked error")
+		addrsMocked = []string{"1.1.1.1", "2.2.2.2"}
+	)
+
+	flagext.DefaultValues(&cfg)
+	cfg.discoverMembersBackoff.MinBackoff = time.Millisecond
+	cfg.discoverMembersBackoff.MaxBackoff = time.Millisecond
+	require.Greater(t, cfg.discoverMembersBackoff.MaxRetries, 0)
+
+	tests := map[string]struct {
+		numResolveFailures int
+		expectedErr        error
+		expectedAddrs      []string
+	}{
+		"first resolution succeed": {
+			numResolveFailures: 0,
+			expectedAddrs:      addrsMocked,
+		},
+		"first 3 resolutions fails": {
+			numResolveFailures: 3,
+			expectedAddrs:      addrsMocked,
+		},
+		"all resolutions fail": {
+			numResolveFailures: cfg.discoverMembersBackoff.MaxRetries,
+			expectedErr:        errMocked,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			currResolveFailures := 0
+
+			dns := newDNSProviderMock(func(_ []string) ([]string, error) {
+				if currResolveFailures < testData.numResolveFailures {
+					currResolveFailures++
+					return nil, errMocked
+				}
+
+				return addrsMocked, nil
+			})
+
+			mkv := NewKV(cfg, log.NewNopLogger(), dns, prometheus.NewPedanticRegistry())
+			addrs, err := mkv.discoverMembersWithRetries(context.Background(), []string{"dns+memberlist.cluster"})
+
+			if testData.expectedErr != nil {
+				require.EqualError(t, err, errMocked.Error())
+				require.Equal(t, cfg.discoverMembersBackoff.MaxRetries, currResolveFailures)
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, testData.expectedAddrs, addrs)
+		})
+	}
 }
 
 func getFreePorts(count int) ([]int, error) {
@@ -1132,7 +1557,7 @@ func TestMultipleCodecs(t *testing.T) {
 		distributedCounterCodec{},
 	}
 
-	mkv1 := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv1 := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv1) //nolint:errcheck
 
@@ -1175,7 +1600,7 @@ func TestMultipleCodecs(t *testing.T) {
 	require.NoError(t, err)
 
 	// We will read values from second KV, which will join the first one
-	mkv2 := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv2 := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv2))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv2) //nolint:errcheck
 
@@ -1213,46 +1638,108 @@ func TestRejoin(t *testing.T) {
 
 	var cfg1 KVConfig
 	flagext.DefaultValues(&cfg1)
-	cfg1.TCPTransport = TCPTransportConfig{
-		BindAddrs: getLocalhostAddrs(),
-		BindPort:  ports[0],
-	}
+	cfg1.TCPTransport.BindAddrs = getLocalhostAddrs()
+	cfg1.TCPTransport.BindPort = ports[0]
 
 	cfg1.RandomizeNodeName = true
 	cfg1.Codecs = []codec.Codec{dataCodec{}}
 	cfg1.AbortIfJoinFails = false
+	cfg1.probeInterval = 500 * time.Millisecond
 
 	cfg2 := cfg1
 	cfg2.TCPTransport.BindPort = ports[1]
 	cfg2.JoinMembers = []string{net.JoinHostPort("localhost", strconv.Itoa(ports[0]))}
 	cfg2.RejoinInterval = 1 * time.Second
 
-	mkv1 := NewKV(cfg1, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv1 := NewKV(cfg1, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
-	defer services.StopAndAwaitTerminated(context.Background(), mkv1) //nolint:errcheck
+	t.Cleanup(func() {
+		// Ignore error since we explicitly stop this instance mid-test
+		_ = services.StopAndAwaitTerminated(context.Background(), mkv1)
+	})
 
-	mkv2 := NewKV(cfg2, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv2 := NewKV(cfg2, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv2))
-	defer services.StopAndAwaitTerminated(context.Background(), mkv2) //nolint:errcheck
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), mkv2))
+	})
 
-	membersFunc := func() interface{} {
-		return mkv2.memberlist.NumMembers()
+	expectMembers := func(expected int) func() bool {
+		return func() bool { return mkv2.memberlist.NumMembers() == expected }
 	}
 
-	poll(t, 5*time.Second, 2, membersFunc)
+	require.Eventually(t, expectMembers(2), 10*time.Second, 100*time.Millisecond, "expected 2 members in the cluster")
 
 	// Shutdown first KV
 	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), mkv1))
 
 	// Second KV should see single member now.
-	poll(t, 5*time.Second, 1, membersFunc)
+	require.Eventually(t, expectMembers(1), 10*time.Second, 100*time.Millisecond, "expected 1 member in the cluster")
 
 	// Let's start first KV again. It is not configured to join the cluster, but KV2 is rejoining.
-	mkv1 = NewKV(cfg1, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
-	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
-	defer services.StopAndAwaitTerminated(context.Background(), mkv1) //nolint:errcheck
+	mkv1Restarted := NewKV(cfg1, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1Restarted))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), mkv1Restarted))
+	})
 
-	poll(t, 5*time.Second, 2, membersFunc)
+	require.Eventually(t, expectMembers(2), 10*time.Second, 100*time.Millisecond, "expected 2 members in the cluster")
+}
+
+func TestRejoinWithDifferentSeedNodes(t *testing.T) {
+	ports, err := getFreePorts(3)
+	require.NoError(t, err)
+
+	var cfg1 KVConfig
+	flagext.DefaultValues(&cfg1)
+	cfg1.TCPTransport.BindAddrs = getLocalhostAddrs()
+	cfg1.TCPTransport.BindPort = ports[0]
+
+	cfg1.RandomizeNodeName = true
+	cfg1.Codecs = []codec.Codec{dataCodec{}}
+	cfg1.AbortIfJoinFails = false
+
+	// cfg2: joins cfg1 initially, rejoins using cfg3's address via RejoinSeedNodes.
+	cfg2 := cfg1
+	cfg2.TCPTransport.BindPort = ports[1]
+	cfg2.JoinMembers = []string{net.JoinHostPort("localhost", strconv.Itoa(ports[0]))}
+	cfg2.RejoinSeedNodes = []string{net.JoinHostPort("localhost", strconv.Itoa(ports[2]))}
+	cfg2.RejoinInterval = 1 * time.Second
+
+	// cfg3: standalone node (no join members), will be discovered by cfg2 via rejoin.
+	cfg3 := cfg1
+	cfg3.TCPTransport.BindPort = ports[2]
+
+	mkv1 := NewKV(cfg1, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), mkv1))
+	})
+
+	mkv2 := NewKV(cfg2, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv2))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), mkv2))
+	})
+
+	// Initially mkv2 should be connected to mkv1.
+	expectMembers := func(kv *KV, expected int) func() bool {
+		return func() bool { return kv.memberlist.NumMembers() == expected }
+	}
+	require.Eventually(t, expectMembers(mkv2, 2), 10*time.Second, 100*time.Millisecond, "expected 2 members in the cluster")
+
+	// Now start mkv3. mkv2's RejoinSeedNodes points to mkv3, so mkv2 should discover mkv3 via periodic rejoin.
+	mkv3 := NewKV(cfg3, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv3))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), mkv3))
+	})
+
+	// mkv2 should connect to mkv3 via rejoin (using RejoinSeedNodes).
+	// All three should eventually see each other.
+	require.Eventually(t, expectMembers(mkv1, 3), 10*time.Second, 100*time.Millisecond, "expected mkv1 to see 3 members")
+	require.Eventually(t, expectMembers(mkv2, 3), 10*time.Second, 100*time.Millisecond, "expected mkv2 to see 3 members")
+	require.Eventually(t, expectMembers(mkv3, 3), 10*time.Second, 100*time.Millisecond, "expected mkv3 to see 3 members")
 }
 
 func TestMessageBuffer(t *testing.T) {
@@ -1275,16 +1762,14 @@ func TestMessageBuffer(t *testing.T) {
 func TestNotifyMsgResendsOnlyChanges(t *testing.T) {
 	codec := dataCodec{}
 
-	cfg := KVConfig{
-		TCPTransport: TCPTransportConfig{
-			BindAddrs: getLocalhostAddrs(),
-		},
-	}
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
 	// We will be checking for number of messages in the broadcast queue, so make sure to use known retransmit factor.
 	cfg.RetransmitMult = 1
 	cfg.Codecs = append(cfg.Codecs, codec)
 
-	kv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), kv))
 	defer services.StopAndAwaitTerminated(context.Background(), kv) //nolint:errcheck
 
@@ -1344,17 +1829,15 @@ func TestNotifyMsgResendsOnlyChanges(t *testing.T) {
 func TestSendingOldTombstoneShouldNotForwardMessage(t *testing.T) {
 	codec := dataCodec{}
 
-	cfg := KVConfig{
-		TCPTransport: TCPTransportConfig{
-			BindAddrs: getLocalhostAddrs(),
-		},
-	}
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
 	// We will be checking for number of messages in the broadcast queue, so make sure to use known retransmit factor.
 	cfg.RetransmitMult = 1
 	cfg.LeftIngestersTimeout = 5 * time.Minute
 	cfg.Codecs = append(cfg.Codecs, codec)
 
-	kv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), kv))
 	defer services.StopAndAwaitTerminated(context.Background(), kv) //nolint:errcheck
 
@@ -1449,7 +1932,7 @@ func TestFastJoin(t *testing.T) {
 		dataCodec{},
 	}
 
-	mkv1 := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv1 := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv1))
 	defer services.StopAndAwaitTerminated(context.Background(), mkv1) //nolint:errcheck
 
@@ -1465,7 +1948,7 @@ func TestFastJoin(t *testing.T) {
 	// We will read values from second KV, which will join the first one
 	cfg.JoinMembers = []string{net.JoinHostPort("127.0.0.1", strconv.Itoa(mkv1.GetListeningPort()))}
 
-	mkv2 := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	mkv2 := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 	go func() {
 		// Wait a bit, and then start mkv2.
 		time.Sleep(500 * time.Millisecond)
@@ -1489,13 +1972,12 @@ func TestFastJoin(t *testing.T) {
 func TestDelegateMethodsDontCrashBeforeKVStarts(t *testing.T) {
 	codec := dataCodec{}
 
-	cfg := KVConfig{}
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
 	cfg.Codecs = append(cfg.Codecs, codec)
-	cfg.TCPTransport = TCPTransportConfig{
-		BindAddrs: getLocalhostAddrs(),
-	}
+	cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
 
-	kv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, prometheus.NewPedanticRegistry())
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
 
 	// Make sure we can call delegate methods on unstarted service, and they don't crash nor block.
 	kv.LocalState(true)
@@ -1535,12 +2017,13 @@ func TestDelegateMethodsDontCrashBeforeKVStarts(t *testing.T) {
 func TestMetricsRegistration(t *testing.T) {
 	c := dataCodec{}
 
-	cfg := KVConfig{}
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
 	cfg.Codecs = append(cfg.Codecs, c)
 
 	reg := prometheus.NewPedanticRegistry()
-	kv := NewKV(cfg, log.NewNopLogger(), &dnsProviderMock{}, reg)
-	err := kv.CAS(context.Background(), "test", c, func(in interface{}) (out interface{}, retry bool, err error) {
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, reg)
+	err := kv.CAS(context.Background(), "test", c, func(interface{}) (out interface{}, retry bool, err error) {
 		return &data{Members: map[string]member{
 			"member": {},
 		}}, true, nil
@@ -1567,12 +2050,90 @@ func decodeDataFromMarshalledKeyValuePair(t *testing.T, marshalledKVP []byte, ke
 	return d
 }
 
-func marshalKeyValuePair(t *testing.T, key string, codec codec.Codec, value interface{}) []byte {
+func keyValuePair(t *testing.T, key string, codec codec.Codec, value interface{}) *KeyValuePair {
 	data, err := codec.Encode(value)
 	require.NoError(t, err)
 
-	kvp := KeyValuePair{Key: key, Codec: codec.CodecID(), Value: data}
-	data, err = kvp.Marshal()
+	return &KeyValuePair{Key: key, Codec: codec.CodecID(), Value: data}
+
+}
+
+// numKeyWorkers returns the number of registered key worker goroutines.
+func (m *KV) numKeyWorkers() int {
+	m.workersMu.Lock()
+	defer m.workersMu.Unlock()
+
+	return len(m.workersChannels)
+}
+
+func TestCleanupObsoleteEntriesStopsKeyWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := dataCodec{}
+
+		var cfg KVConfig
+		flagext.DefaultValues(&cfg)
+		cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
+		cfg.Codecs = append(cfg.Codecs, c)
+		cfg.ObsoleteEntriesTimeout = 100 * time.Millisecond
+
+		// The KV service is not started: the real TCP transport would block goroutines
+		// in Accept syscalls, which is incompatible with the synctest bubble. Updates
+		// are driven through enqueueKeyUpdate, which is what NotifyMsg uses. Only the
+		// broadcast queues (normally created on service start) are stubbed, because
+		// workers queue forwarded updates into them.
+		kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+		kv.localBroadcasts = &memberlist.TransmitLimitedQueue{NumNodes: func() int { return 1 }, RetransmitMult: cfg.RetransmitMult}
+		kv.gossipBroadcasts = &memberlist.TransmitLimitedQueue{NumNodes: func() int { return 1 }, RetransmitMult: cfg.RetransmitMult}
+
+		enqueueUpdate := func(key string, deleted bool) {
+			t.Helper()
+			encoded, err := c.Encode(&data{Members: map[string]member{
+				"a": {Timestamp: time.Now().Unix(), State: JOINING},
+			}})
+			require.NoError(t, err)
+			require.True(t, kv.enqueueKeyUpdate(key, valueUpdate{value: encoded, codec: c, deleted: deleted, updateTime: time.Now()}))
+		}
+
+		// Receiving an update for a key spawns a worker goroutine for that key, which
+		// merges the update into the store.
+		enqueueUpdate(key, false)
+		synctest.Wait()
+		require.Equal(t, 1, kv.numKeyWorkers())
+		val, err := kv.Get(key, c)
+		require.NoError(t, err)
+		require.NotNil(t, val)
+
+		// Delete the key. Once the tombstone is older than ObsoleteEntriesTimeout, the
+		// cleanup removes the key from the store, and must also stop the key's worker.
+		require.NoError(t, kv.Delete(key))
+		time.Sleep(2 * cfg.ObsoleteEntriesTimeout)
+		kv.cleanupObsoleteEntries()
+		synctest.Wait()
+		require.Equal(t, 0, kv.numKeyWorkers())
+
+		// If the key is seen again, a new worker is spawned, and it stays running.
+		enqueueUpdate(key, false)
+		synctest.Wait()
+		require.Equal(t, 1, kv.numKeyWorkers())
+
+		// A tombstone for a key that is not in the store spawns a worker, but the merge
+		// is a no-op that doesn't (re)create the key, so the worker immediately
+		// deregisters itself and stops. The live key's worker above keeps running, so
+		// the count stays at 1.
+		enqueueUpdate("already-purged-key", true)
+		synctest.Wait()
+		require.Equal(t, 1, kv.numKeyWorkers())
+
+		// Stop the remaining worker: the synctest bubble requires all goroutines
+		// started inside it to exit before the test returns.
+		close(kv.shutdown)
+	})
+}
+
+func marshalKeyValuePair(t *testing.T, key string, codec codec.Codec, value interface{}) []byte {
+	kvp := keyValuePair(t, key, codec, value)
+
+	data, err := kvp.Marshal()
 	require.NoError(t, err)
 	return data
 }
@@ -1587,26 +2148,6 @@ func getOrCreateData(in interface{}) *data {
 	return r
 }
 
-// poll repeatedly evaluates condition until we either timeout, or it succeeds.
-func poll(t testing.TB, d time.Duration, want interface{}, have func() interface{}) {
-	t.Helper()
-
-	deadline := time.Now().Add(d)
-	for {
-		if time.Now().After(deadline) {
-			break
-		}
-		if reflect.DeepEqual(want, have()) {
-			return
-		}
-		time.Sleep(d / 100)
-	}
-	h := have()
-	if !reflect.DeepEqual(want, h) {
-		t.Fatalf("expected %v, got %v", want, h)
-	}
-}
-
 type testLogger struct {
 }
 
@@ -1615,15 +2156,45 @@ func (l testLogger) Log(_ ...interface{}) error {
 }
 
 type dnsProviderMock struct {
-	resolved []string
+	onResolve func([]string) ([]string, error)
+
+	resolvedMx sync.Mutex
+	resolved   []string
+}
+
+func newDNSProviderMock(onResolve func([]string) ([]string, error)) *dnsProviderMock {
+	return &dnsProviderMock{
+		onResolve: onResolve,
+	}
 }
 
 func (p *dnsProviderMock) Resolve(_ context.Context, addrs []string) error {
+	resolved, err := p.onResolve(addrs)
+
+	p.resolvedMx.Lock()
+	p.resolved = resolved
+	p.resolvedMx.Unlock()
+
+	return err
+}
+
+func (p *dnsProviderMock) Addresses() []string {
+	p.resolvedMx.Lock()
+	defer p.resolvedMx.Unlock()
+
+	return slices.Clone(p.resolved)
+}
+
+type staticDNSProviderMock struct {
+	resolved []string
+}
+
+func (p *staticDNSProviderMock) Resolve(_ context.Context, addrs []string) error {
 	p.resolved = addrs
 	return nil
 }
 
-func (p dnsProviderMock) Addresses() []string {
+func (p staticDNSProviderMock) Addresses() []string {
 	return p.resolved
 }
 
@@ -1646,4 +2217,1311 @@ func (p *delayedDNSProviderMock) Resolve(_ context.Context, addrs []string) erro
 
 func (p delayedDNSProviderMock) Addresses() []string {
 	return p.resolved
+}
+
+func TestGetBroadcastsPrefersLocalUpdates(t *testing.T) {
+	codec := dataCodec{}
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
+	// We will be checking for number of messages in the broadcast queue, so make sure to use known retransmit factor.
+	cfg.RetransmitMult = 1
+	cfg.Codecs = append(cfg.Codecs, codec)
+
+	reg := prometheus.NewRegistry()
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, reg)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), kv))
+	defer services.StopAndAwaitTerminated(context.Background(), kv) //nolint:errcheck
+
+	now := time.Now()
+
+	smallUpdate := &data{Members: map[string]member{"a": {Timestamp: now.Unix(), State: JOINING}}}
+	bigUpdate := &data{Members: map[string]member{"b": {Timestamp: now.Unix(), State: JOINING}, "c": {Timestamp: now.Unix(), State: JOINING}, "d": {Timestamp: now.Unix(), State: JOINING}}}
+	mediumUpdate := &data{Members: map[string]member{"d": {Timestamp: now.Unix(), State: JOINING}, "e": {Timestamp: now.Unix(), State: JOINING}}}
+
+	// No broadcast messages from KV at the beginning.
+	require.Equal(t, 0, len(kv.GetBroadcasts(0, math.MaxInt32)))
+
+	// Check that locally-generated broadcast messages will be prioritized and sent out first, even if they are enqueued later or are smaller than other messages in the queue.
+	kv.broadcastNewValue("non-local", smallUpdate, 1, codec, false, false, time.Now())
+	kv.broadcastNewValue("non-local", bigUpdate, 2, codec, false, false, time.Now())
+	kv.broadcastNewValue("local", smallUpdate, 1, codec, true, false, time.Now())
+	kv.broadcastNewValue("local", bigUpdate, 2, codec, true, false, time.Now())
+	kv.broadcastNewValue("local", mediumUpdate, 3, codec, true, false, time.Now())
+
+	err := testutil.GatherAndCompare(reg, bytes.NewBufferString(`
+		# HELP memberlist_client_messages_in_broadcast_queue Number of user messages in the broadcast queue
+		# TYPE memberlist_client_messages_in_broadcast_queue gauge
+		memberlist_client_messages_in_broadcast_queue{queue="gossip"} 2
+		memberlist_client_messages_in_broadcast_queue{queue="local"} 3
+	`), "memberlist_client_messages_in_broadcast_queue")
+	require.NoError(t, err)
+
+	msgs := kv.GetBroadcasts(0, 10000)
+	require.Len(t, msgs, 5) // we get all 4 messages
+	require.Equal(t, "local", getKey(t, msgs[0]))
+	require.Equal(t, "local", getKey(t, msgs[1]))
+	require.Equal(t, "local", getKey(t, msgs[2]))
+	require.Equal(t, "non-local", getKey(t, msgs[3]))
+	require.Equal(t, "non-local", getKey(t, msgs[4]))
+
+	// Check that TransmitLimitedQueue.GetBroadcasts preferred larger messages (it does that).
+	require.True(t, len(msgs[0]) > len(msgs[1])) // Bigger local message is returned before medium one.
+	require.True(t, len(msgs[1]) > len(msgs[2])) // Medium local message is returned before small one.
+	require.True(t, len(msgs[3]) > len(msgs[4])) // Bigger non-local message is returned before smaller one
+}
+
+func getKey(t *testing.T, msg []byte) string {
+	kvPair := KeyValuePair{}
+	err := kvPair.Unmarshal(msg)
+	require.NoError(t, err)
+	return kvPair.Key
+}
+
+func TestRaceBetweenStoringNewValueForKeyAndUpdatingIt(t *testing.T) {
+	codec := dataCodec{}
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.Codecs = append(cfg.Codecs, codec)
+	cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
+
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), kv))
+	t.Cleanup(func() {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), kv))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	vals := make(chan int64, 10000)
+
+	go func() {
+		d := &data{Members: map[string]member{}}
+		for i := 0; i < 100; i++ {
+			d.Members[fmt.Sprintf("member_%d", i)] = member{Timestamp: time.Now().Unix(), State: i % 3}
+		}
+
+		err := kv.CAS(context.Background(), key, codec, func(_ interface{}) (out interface{}, retry bool, err error) {
+			return d, true, nil
+		})
+		require.NoError(t, err)
+
+		// keep iterating over d.Members. If other goroutine modifies same ring descriptor, we will see a race error.
+		for ctx.Err() == nil {
+			sum := int64(0)
+			for n, m := range d.Members {
+				sum += int64(len(n))
+				sum += m.Timestamp
+				sum += int64(len(m.Tokens))
+			}
+			vals <- sum
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	// Wait until CAS and iteration finishes before pushing remote state.
+	<-vals
+
+	s := 0
+	for ctx.Err() == nil {
+		s++
+		d := &data{Members: map[string]member{}}
+		for i := 0; i < 100; i++ {
+			d.Members[fmt.Sprintf("member_%d", i)] = member{Timestamp: time.Now().Unix(), State: (i + s) % 3}
+		}
+
+		kv.MergeRemoteState(marshalState(t, keyValuePair(t, key, codec, d)), false)
+		time.Sleep(10 * time.Millisecond)
+
+	drain:
+		select {
+		case <-vals:
+			goto drain
+		default:
+			// stop draining.
+		}
+	}
+}
+
+func marshalState(t *testing.T, kvps ...*KeyValuePair) []byte {
+	buf := bytes.Buffer{}
+
+	for _, kvp := range kvps {
+		d, err := kvp.Marshal()
+		require.NoError(t, err)
+		err = binary.Write(&buf, binary.BigEndian, uint32(len(d)))
+		require.NoError(t, err)
+		buf.Write(d)
+	}
+
+	return buf.Bytes()
+}
+
+func TestNotificationDelay(t *testing.T) {
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	// We're going to trigger sends manually, so effectively disable the automatic send interval.
+	const hundredYears = 100 * 365 * 24 * time.Hour
+	cfg.NotifyInterval = hundredYears
+	kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+
+	watchChan := make(chan string, 16)
+
+	// Add ourselves as a watcher.
+	kv.watchersMu.Lock()
+	kv.watchers["foo_123"] = append(kv.watchers["foo_123"], watchChan)
+	kv.watchers["foo_124"] = append(kv.watchers["foo_124"], watchChan)
+	kv.watchersMu.Unlock()
+
+	defer func() {
+		kv.watchersMu.Lock()
+		removeWatcherChannel("foo_123", watchChan, kv.watchers)
+		removeWatcherChannel("foo_124", watchChan, kv.watchers)
+		kv.watchersMu.Unlock()
+	}()
+
+	verifyNotifs := func(expected map[string]int, comment string) {
+		observed := make(map[string]int, len(expected))
+		for kk := range expected {
+			observed[kk] = 0
+		}
+	loop:
+		for {
+			select {
+			case k := <-watchChan:
+				observed[k]++
+			default:
+				break loop
+			}
+		}
+		require.Equal(t, expected, observed, comment)
+	}
+
+	drainChan := func() {
+		for {
+			select {
+			case <-watchChan:
+			default:
+				return
+			}
+		}
+	}
+
+	kv.notifyWatchers("foo_123")
+	kv.sendKeyNotifications()
+	verifyNotifs(map[string]int{"foo_123": 1}, "1 change 1 notification")
+
+	// Test coalescing of updates.
+	drainChan()
+	verifyNotifs(map[string]int{"foo_123": 0}, "chan drained")
+	kv.notifyWatchers("foo_123")
+	verifyNotifs(map[string]int{"foo_123": 0}, "no flush -> no watcher notification")
+	kv.notifyWatchers("foo_123")
+	verifyNotifs(map[string]int{"foo_123": 0}, "no flush -> no watcher notification")
+	kv.notifyWatchers("foo_123")
+	verifyNotifs(map[string]int{"foo_123": 0}, "no flush -> no watcher notification")
+	kv.notifyWatchers("foo_123")
+	verifyNotifs(map[string]int{"foo_123": 0}, "no flush -> no watcher notification")
+	kv.notifyWatchers("foo_123")
+	verifyNotifs(map[string]int{"foo_123": 0}, "no flush -> no watcher notification")
+	kv.notifyWatchers("foo_123")
+	verifyNotifs(map[string]int{"foo_123": 0}, "no flush -> no watcher notification")
+	kv.sendKeyNotifications()
+	verifyNotifs(map[string]int{"foo_123": 1}, "flush should coalesce updates")
+
+	// multiple buffered updates
+	drainChan()
+	verifyNotifs(map[string]int{"foo_123": 0}, "chan drained")
+	kv.notifyWatchers("foo_123")
+	kv.sendKeyNotifications()
+	kv.notifyWatchers("foo_123")
+	kv.sendKeyNotifications()
+	verifyNotifs(map[string]int{"foo_123": 2}, "two buffered updates")
+
+	// multiple keys
+	drainChan()
+	kv.notifyWatchers("foo_123")
+	kv.notifyWatchers("foo_124")
+	kv.sendKeyNotifications()
+	verifyNotifs(map[string]int{"foo_123": 1, "foo_124": 1}, "2 changes 2 notifications")
+	kv.sendKeyNotifications()
+	verifyNotifs(map[string]int{"foo_123": 0, "foo_124": 0}, "no new notifications")
+
+	// sendKeyNotifications can be called repeatedly without new updates.
+	kv.sendKeyNotifications()
+	kv.sendKeyNotifications()
+	kv.sendKeyNotifications()
+	kv.sendKeyNotifications()
+
+	// Finally, exercise the monitor method.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tick := make(chan time.Time)
+	go kv.monitorKeyNotifications(ctx, tick)
+	kv.notifyWatchers("foo_123")
+	tick <- time.Now()
+
+	require.Eventually(t, func() bool {
+		select {
+		case k := <-watchChan:
+			if k != "foo_123" {
+				panic(fmt.Sprintf("unexpected key: %s", k))
+			}
+			return true
+		default: // nothing yet.
+			return false
+		}
+	}, 20*time.Second, 100*time.Millisecond)
+}
+
+func TestMemberlist_WatchPrefix(t *testing.T) {
+	t.Run("buffer size configuration", func(t *testing.T) {
+		// Test custom buffer size
+		var cfg KVConfig
+		flagext.DefaultValues(&cfg)
+		cfg.WatchPrefixBufferSize = 10
+		kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+		require.Equal(t, 10, kv.cfg.WatchPrefixBufferSize)
+
+		// Test invalid buffer size is rejected
+		kvInit := NewKVInitService(&KVConfig{WatchPrefixBufferSize: -3}, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+		_, err := kvInit.GetMemberlistKV()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid WatchPrefixBufferSize")
+
+		kvInit = NewKVInitService(&KVConfig{WatchPrefixBufferSize: 0}, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+		_, err = kvInit.GetMemberlistKV()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid WatchPrefixBufferSize")
+	})
+
+	t.Run("buffering behavior", func(t *testing.T) {
+		// Create KV with small buffer and fast notification interval
+		var cfg KVConfig
+		flagext.DefaultValues(&cfg)
+		cfg.WatchPrefixBufferSize = 2
+		// Disable notification batching to get immediate notifications
+		cfg.NotifyInterval = 0
+		kv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+		require.NoError(t, services.StartAndAwaitRunning(context.Background(), kv))
+		defer services.StopAndAwaitTerminated(context.Background(), kv) //nolint:errcheck
+
+		// Setup test data
+		codec := dataCodec{}
+		prefix := "test_prefix_"
+		keys := []string{prefix + "1", prefix + "2", prefix + "3"}
+
+		// Create a channel to receive notifications
+		notifications := make([]string, 0)
+		mu := sync.Mutex{} // Protect notifications slice
+		done := make(chan struct{})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Start watching prefix
+		go func() {
+			kv.WatchPrefix(ctx, prefix, codec, func(key string, _ any) bool {
+				mu.Lock()
+				notifications = append(notifications, key)
+				count := len(notifications)
+				mu.Unlock()
+
+				if count == len(keys) {
+					close(done)
+				}
+				return true // keep watching
+			})
+		}()
+
+		// Give the watcher time to register
+		time.Sleep(100 * time.Millisecond)
+
+		// Update keys
+		for _, key := range keys {
+			err := kv.CAS(context.Background(), key, codec, func(in interface{}) (out interface{}, retry bool, err error) {
+				d := getOrCreateData(in)
+				d.Members["test"] = member{Timestamp: time.Now().Unix(), State: JOINING}
+				return d, true, nil
+			})
+			require.NoError(t, err)
+		}
+
+		// Wait for all notifications or timeout
+		select {
+		case <-done:
+			mu.Lock()
+			defer mu.Unlock()
+			require.Len(t, notifications, len(keys))
+			// Verify all keys were notified about
+			for _, k := range keys {
+				found := false
+				for _, n := range notifications {
+					if n == k {
+						found = true
+						break
+					}
+				}
+				require.True(t, found, "key %s should have generated a notification", k)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for notifications")
+		}
+	})
+}
+
+func TestMemberlist_WatchKey_ShouldStartNotifyingChangesBeforeFullJoinIsCompleted(t *testing.T) {
+	tests := map[string]struct {
+		NotifyInterval time.Duration
+	}{
+		"synchronous WatchKey() notifications": {
+			NotifyInterval: 0,
+		},
+		"asynchronous WatchKey() notifications": {
+			NotifyInterval: 50 * time.Millisecond,
+		},
+	}
+
+	// Don't run tests parallelly to avoid having logs interleaved. Also, we can't log using testing.T
+	// because of a race caused by memberlist library not guaranteeing every goroutine to be terminated
+	// when KV.stopping() returns (no easy way to fix it).
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			// In this test we create two KV clients and we make them join the same memberlist cluster.
+			// A client is called "producer" because it produces changes, and the other client is called
+			// "consumer" because it's the one joining the cluster later and watching changes.
+			var (
+				producerCfg KVConfig
+				consumerCfg KVConfig
+				testCodec   = dataCodec{}
+			)
+
+			// Timeout the test in case it blocks for any reason.
+			ctx, cancelCtx := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(cancelCtx)
+
+			flagext.DefaultValues(&producerCfg)
+			flagext.DefaultValues(&consumerCfg)
+			producerCfg.TCPTransport.BindAddrs = getLocalhostAddrs()
+			producerCfg.TCPTransport.BindPort = 0
+			producerCfg.Codecs = []codec.Codec{testCodec}
+
+			consumerCfg.TCPTransport.BindAddrs = getLocalhostAddrs()
+			consumerCfg.TCPTransport.BindPort = 0
+			consumerCfg.Codecs = []codec.Codec{testCodec}
+			consumerCfg.NotifyInterval = testData.NotifyInterval
+
+			// First let's start a producer.
+			producer := NewKV(producerCfg, log.With(log.NewLogfmtLogger(os.Stderr), "component", "producer"), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+			require.NoError(t, services.StartAndAwaitRunning(ctx, producer))
+			t.Cleanup(func() {
+				require.NoError(t, services.StopAndAwaitTerminated(ctx, producer))
+			})
+
+			// Continuously produce changes in the producer, until the test is over.
+			producerDone := make(chan struct{})
+			producerWait := sync.WaitGroup{}
+			producerWait.Add(1)
+
+			go func() {
+				defer producerWait.Done()
+
+				for {
+					select {
+					case <-producerDone:
+						return
+
+					case <-time.After(10 * time.Millisecond):
+						require.NoError(t, producer.CAS(ctx, key, testCodec, func(in interface{}) (out interface{}, retry bool, err error) {
+							return &data{
+								Members: map[string]member{"test": {Timestamp: time.Now().UnixNano()}},
+							}, true, nil
+						}))
+					}
+				}
+			}()
+
+			// Configure the consumer to join the same memberlist cluster of the producer.
+			producerAddr := fmt.Sprintf("%s:%d", getLocalhostAddr(), producer.GetListeningPort())
+			require.NoError(t, consumerCfg.JoinMembers.Set(producerAddr))
+			consumerDNSResolver := &staticDNSProviderMock{resolved: []string{producerAddr}}
+
+			// Mock the consumer to control when we want to get the full-join being completed.
+			consumerCfg.beforeJoinMembersOnStartupHook = func(ctx context.Context) {
+				// Block the full-join until the test is over (context gets canceled).
+				<-ctx.Done()
+			}
+
+			// Start a consumer.
+			consumer := NewKV(consumerCfg, log.With(log.NewLogfmtLogger(os.Stderr), "component", "consumer"), consumerDNSResolver, prometheus.NewPedanticRegistry())
+			require.NoError(t, services.StartAndAwaitRunning(ctx, consumer))
+			t.Cleanup(func() {
+				require.NoError(t, services.StopAndAwaitTerminated(ctx, consumer))
+			})
+
+			// Watch the key that the producer keeps changing.
+			watchKeyNotified := make(chan struct{})
+			consumer.WatchKey(ctx, key, testCodec, func(i interface{}) bool {
+				close(watchKeyNotified)
+
+				// Returning false, the key gets stop being watched.
+				return false
+			})
+
+			// Ensure the key change gets notified.
+			select {
+			case <-watchKeyNotified:
+			case <-ctx.Done():
+				require.Fail(t, "WatchKey() has not notified the producer's change before the test timeout expired")
+			}
+
+			// The test is over. We can stop the producer.
+			close(producerDone)
+			producerWait.Wait()
+
+		})
+	}
+}
+
+func TestMemberlist_WatchKey_ShouldNotifyCurrentValueOnStart(t *testing.T) {
+	const name = "Ing 1"
+
+	tests := map[string]struct {
+		setBeforeWatch bool
+	}{
+		"key is set before the watch starts": {
+			setBeforeWatch: true,
+		},
+		"key is set while the watch starts": {
+			setBeforeWatch: false,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			withFixtures(t, func(t *testing.T, kv *Client) {
+				// A value set before WatchKey() is called (for example, between a caller's Get() and
+				// WatchKey()) produces no change notification for the watcher, so it must be delivered
+				// as the current value.
+				if testData.setBeforeWatch {
+					require.NoError(t, cas(kv, key, updateFn(name)))
+				}
+
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+
+				received := make(chan interface{}, 1)
+				watchDone := make(chan struct{})
+				go func() {
+					defer close(watchDone)
+					kv.WatchKey(ctx, key, func(in interface{}) bool {
+						received <- in
+						return false
+					})
+				}()
+
+				if !testData.setBeforeWatch {
+					// This can run before or after the watcher is registered.
+					require.NoError(t, cas(kv, key, updateFn(name)))
+				}
+
+				select {
+				case in := <-received:
+					// A missing key must not be delivered as a nil value.
+					require.NotNil(t, in)
+					require.Contains(t, in.(*data).Members, name)
+				case <-ctx.Done():
+					require.Fail(t, "WatchKey() has not notified the current value before the test timeout expired")
+				}
+				<-watchDone
+			})
+		})
+	}
+}
+
+// Every duration interval (100ms), cleanupObsoleteEntries() is called to remove obsolete entries from the KV store
+// After 5*duration interval (500ms), notifications are sent to the appropriate keys. Since the entry is already deleted,
+// it should generate a nil notification that will never be processed.
+func TestWatchPrefixHandlesGracefullyNotificationForAlreadyDeletedEntry(t *testing.T) {
+	c := dataCodec{}
+
+	duration := 100 * time.Millisecond
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport = TCPTransportConfig{
+		BindAddrs: getLocalhostAddrs(),
+		BindPort:  0, // randomize ports
+	}
+	cfg.ClusterLabelVerificationDisabled = true
+	cfg.Codecs = []codec.Codec{c}
+
+	cfg.ObsoleteEntriesTimeout = duration
+	cfg.NotifyInterval = 5 * duration // 5 * ObsoleteEntriesTimeout to ensure the entry is deleted before sending the notification
+
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, prometheus.NewPedanticRegistry())
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), mkv))
+	defer services.StopAndAwaitTerminated(context.Background(), mkv) //nolint:errcheck
+
+	kv, err := NewClient(mkv, c)
+	require.NoError(t, err)
+
+	const key = "test"
+
+	val := get(t, kv, key)
+	if val != nil {
+		t.Error("Expected nil, got:", val)
+	}
+
+	done := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		kv.WatchPrefix(ctx, "test", func(s string, i interface{}) bool {
+			if i == nil {
+				t.Errorf("got nil notification for %q", s)
+			}
+			close(done)
+			return true
+		})
+	}()
+
+	// Create entry with key:  test
+	err = cas(kv, key, updateFn("test"))
+	require.NoError(t, err)
+
+	// Delete entry with key: test
+	err = kv.Delete(context.Background(), key)
+	if err != nil {
+		t.Fatalf("Failed to delete key %s: %v", key, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+	}
+}
+
+func TestNetworkPartition_RecoveryViaRejoin(t *testing.T) {
+	const key = "test"
+
+	var (
+		c      = dataCodec{}
+		ctx    = context.Background()
+		logger = log.NewNopLogger()
+
+		dnsMappingMx sync.RWMutex
+		dnsMapping   = map[string][]string{}
+	)
+
+	clearDNSResolution := func() {
+		dnsMappingMx.Lock()
+		defer dnsMappingMx.Unlock()
+		dnsMapping = map[string][]string{}
+	}
+
+	mockDNSResolution := func(input string, output []string) {
+		dnsMappingMx.Lock()
+		defer dnsMappingMx.Unlock()
+		dnsMapping[input] = output
+	}
+
+	resolveDNS := func(addrs []string) ([]string, error) {
+		dnsMappingMx.RLock()
+		defer dnsMappingMx.RUnlock()
+		var resolved []string
+		for _, addr := range addrs {
+			if actual, ok := dnsMapping[addr]; ok {
+				resolved = append(resolved, actual...)
+			}
+		}
+		return resolved, nil
+	}
+
+	expectMemberlistMembersCount := func(kv *KV, expected int) func(*assert.CollectT) {
+		return func(collect *assert.CollectT) {
+			require.Equal(collect, expected, kv.memberlist.NumMembers())
+		}
+	}
+
+	expectDataMembers := func(client *Client, expected []string) func(*assert.CollectT) {
+		return func(collect *assert.CollectT) {
+			actual := getData(t, client, key)
+			require.NotNil(collect, actual)
+			require.Equal(collect, expected, actual.getAllMembers())
+		}
+	}
+
+	// Helper to create node config with zone-aware routing
+	makeConfig := func(name, zone, role string, port int) KVConfig {
+		var cfg KVConfig
+		flagext.DefaultValues(&cfg)
+		cfg.NodeName = name
+		cfg.TCPTransport.BindAddrs = getLocalhostAddrs()
+		cfg.TCPTransport.BindPort = port
+		cfg.Codecs = []codec.Codec{c}
+		cfg.JoinMembers = []string{"dns+" + name + "-join"}
+		cfg.AbortIfJoinFails = role == roleConfigMember
+		cfg.RejoinSeedNodes = []string{"dns+" + name + "-rejoin"}
+		cfg.RejoinInterval = 100 * time.Millisecond
+		cfg.ZoneAwareRouting = ZoneAwareRoutingConfig{
+			Enabled: true,
+			Zone:    zone,
+			Role:    role,
+		}
+		// Disable push/pull to just rely on rejoin and gossiping.
+		cfg.PushPullInterval = 0
+		// Fast settings for tests
+		cfg.GossipInterval = 50 * time.Millisecond
+		cfg.LeaveTimeout = 100 * time.Millisecond
+		return cfg
+	}
+
+	// Config:
+	// - Members:
+	//   - Abort if join at startup fails
+	//   - Rejoin enabled, discovering only same-zone bridges
+	//
+	// - Bridges:
+	//   - Do not abort if join at startup fails
+	//   - Rejoin enabled, discovering all bridges
+	//
+	// Initial condition:
+	// - The two zones are isolated
+	//
+	// Recovery:
+	// - The bridge in zone-b recovers from network partitioning and discovers the bridge in zone-a
+	t.Run("zones isolated at startup, then recover via rejoin", func(t *testing.T) {
+		clearDNSResolution()
+
+		// Get nodes ports.
+		ports, err := getFreePorts(3)
+		require.NoError(t, err)
+
+		bridgeZoneAPort := ports[0]
+		bridgeZoneBPort := ports[1]
+		memberZoneBPort := ports[2]
+
+		bridgeZoneAAddr := net.JoinHostPort("localhost", strconv.Itoa(bridgeZoneAPort))
+		bridgeZoneBAddr := net.JoinHostPort("localhost", strconv.Itoa(bridgeZoneBPort))
+
+		// Start both bridges in isolation.
+		cfgBridgeA := makeConfig("bridge-zone-a", "zone-a", roleConfigBridge, bridgeZoneAPort)
+		cfgBridgeB := makeConfig("bridge-zone-b", "zone-b", roleConfigBridge, bridgeZoneBPort)
+
+		mkvBridgeA := NewKV(cfgBridgeA, log.With(logger, "node", "bridge-zone-a"), newDNSProviderMock(resolveDNS), nil)
+		mkvBridgeB := NewKV(cfgBridgeB, log.With(logger, "node", "bridge-zone-b"), newDNSProviderMock(resolveDNS), nil)
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeA))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeA))
+		})
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeB))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeB))
+		})
+
+		clientBridgeA, err := NewClient(mkvBridgeA, c)
+		require.NoError(t, err)
+		clientBridgeB, err := NewClient(mkvBridgeB, c)
+		require.NoError(t, err)
+
+		// Add "member-A" state via CAS on bridge-zone-a
+		require.NoError(t, cas(clientBridgeA, key, updateFn("member-A")))
+
+		// Start member-zone-b, joining bridge-zone-b
+		mockDNSResolution("dns+member-zone-b-join", []string{bridgeZoneBAddr})
+		mockDNSResolution("dns+member-zone-b-rejoin", []string{bridgeZoneBAddr})
+
+		cfgMemberB := makeConfig("member-zone-b", "zone-b", roleConfigMember, memberZoneBPort)
+		mkvMemberB := NewKV(cfgMemberB, log.With(logger, "node", "member-zone-b"), newDNSProviderMock(resolveDNS), nil)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvMemberB))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvMemberB))
+		})
+
+		clientMemberB, err := NewClient(mkvMemberB, c)
+		require.NoError(t, err)
+
+		// Add "member-B" on member-zone-b
+		require.NoError(t, cas(clientMemberB, key, updateFn("member-B")))
+
+		// We expect the two zones are isolated (1 node in zone-a, and 2 nodes in zone-b).
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeA, 1), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeB, 2), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberB, 2), 3*time.Second, 100*time.Millisecond)
+
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeA, []string{"member-A"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeB, []string{"member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberB, []string{"member-B"}), 3*time.Second, 100*time.Millisecond)
+
+		// The bridge in zone-b recovers from network partitioning and discovers the bridge in zone-a.
+		mockDNSResolution("dns+bridge-zone-b-join", []string{bridgeZoneAAddr})
+		mockDNSResolution("dns+bridge-zone-b-rejoin", []string{bridgeZoneAAddr})
+
+		// Every node should see each other.
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeA, 3), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeB, 3), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberB, 3), 3*time.Second, 100*time.Millisecond)
+
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeA, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeB, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberB, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+	})
+
+	// Config:
+	// - Members:
+	//   - Abort if join at startup fails
+	//   - Rejoin enabled, discovering only same-zone bridges
+	//
+	// - Bridges:
+	//   - Do not abort if join at startup fails
+	//   - Rejoin enabled, discovering all bridges
+	//
+	// Initial condition:
+	// - The two zones are isolated
+	//
+	// Recovery:
+	// - The bridge in zone-b crashes
+	// - A new bridge in zone-b is started (with empty state)
+	// - The new bridge in zone-b discovers the bridge in zone-a
+	// - The member in zone-b discovers the new bridge in zone-b via rejoin
+	// - State is propagated from member-zone-b to new bridge-zone-b to bridge-zone-a
+	t.Run("zones isolated at startup, then recover via new non-isolated bridge", func(t *testing.T) {
+		clearDNSResolution()
+
+		// Get nodes ports.
+		ports, err := getFreePorts(3)
+		require.NoError(t, err)
+
+		bridgeZoneAPort := ports[0]
+		bridgeZoneBPort := ports[1]
+		memberZoneBPort := ports[2]
+
+		bridgeZoneAAddr := net.JoinHostPort("localhost", strconv.Itoa(bridgeZoneAPort))
+		bridgeZoneBAddr := net.JoinHostPort("localhost", strconv.Itoa(bridgeZoneBPort))
+
+		// Start both bridges in isolation.
+		cfgBridgeA := makeConfig("bridge-zone-a", "zone-a", roleConfigBridge, bridgeZoneAPort)
+		cfgBridgeB := makeConfig("bridge-zone-b", "zone-b", roleConfigBridge, bridgeZoneBPort)
+
+		mkvBridgeA := NewKV(cfgBridgeA, log.With(logger, "node", "bridge-zone-a"), newDNSProviderMock(resolveDNS), nil)
+		mkvBridgeB := NewKV(cfgBridgeB, log.With(logger, "node", "bridge-zone-b"), newDNSProviderMock(resolveDNS), nil)
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeA))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeA))
+		})
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeB))
+		t.Cleanup(func() {
+			// Ignore error because it could be already terminated.
+			_ = services.StopAndAwaitTerminated(ctx, mkvBridgeB)
+		})
+
+		clientBridgeA, err := NewClient(mkvBridgeA, c)
+		require.NoError(t, err)
+		clientBridgeB, err := NewClient(mkvBridgeB, c)
+		require.NoError(t, err)
+
+		// Add "member-A" state via CAS on bridge-zone-a
+		require.NoError(t, cas(clientBridgeA, key, updateFn("member-A")))
+
+		// Start member-zone-b, joining bridge-zone-b.
+		mockDNSResolution("dns+member-zone-b-join", []string{bridgeZoneBAddr})
+		mockDNSResolution("dns+member-zone-b-rejoin", []string{bridgeZoneBAddr})
+
+		cfgMemberB := makeConfig("member-zone-b", "zone-b", roleConfigMember, memberZoneBPort)
+		mkvMemberB := NewKV(cfgMemberB, log.With(logger, "node", "member-zone-b"), newDNSProviderMock(resolveDNS), nil)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvMemberB))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvMemberB))
+		})
+
+		clientMemberB, err := NewClient(mkvMemberB, c)
+		require.NoError(t, err)
+
+		// Add "member-B" on member-zone-b
+		require.NoError(t, cas(clientMemberB, key, updateFn("member-B")))
+
+		// We expect bridge-zone-a to be isolated (1 node), and bridge-zone-b + member-zone-b together (2 nodes).
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeA, 1), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeB, 2), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberB, 2), 3*time.Second, 100*time.Millisecond)
+
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeA, []string{"member-A"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeB, []string{"member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberB, []string{"member-B"}), 3*time.Second, 100*time.Millisecond)
+
+		// Terminate bridge-zone-b.
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeB))
+
+		// Start a new bridge-zone-b (with empty state).
+		// Configure DNS so that bridge-zone-b can now discover bridge-zone-a.
+		mockDNSResolution("dns+bridge-zone-b-join", []string{bridgeZoneAAddr})
+		mockDNSResolution("dns+bridge-zone-b-rejoin", []string{bridgeZoneAAddr})
+
+		cfgBridgeBNew := makeConfig("bridge-zone-b", "zone-b", roleConfigBridge, bridgeZoneBPort)
+		mkvBridgeBNew := NewKV(cfgBridgeBNew, log.With(logger, "node", "bridge-zone-b-new"), newDNSProviderMock(resolveDNS), nil)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeBNew))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeBNew))
+		})
+
+		clientBridgeBNew, err := NewClient(mkvBridgeBNew, c)
+		require.NoError(t, err)
+
+		// Every node should see each other.
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeA, 3), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeBNew, 3), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberB, 3), 3*time.Second, 100*time.Millisecond)
+
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeA, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeBNew, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberB, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+	})
+
+	// Config:
+	// - Members:
+	//   - Abort if join at startup fails
+	//   - Rejoin enabled, discovering only same-zone bridges
+	//
+	// - Bridges:
+	//   - Do not abort if join at startup fails
+	//   - Rejoin enabled, discovering all bridges
+	//
+	// Initial condition:
+	// - Both zones are connected (all 4 nodes see each other)
+	// - Both bridges crash and restart with empty state
+	//
+	// Recovery:
+	// - Existing members rejoin the restarted bridges
+	// - State is recovered from existing members
+	t.Run("all bridges lost, then state recovery via existing members rejoin", func(t *testing.T) {
+		clearDNSResolution()
+
+		ports, err := getFreePorts(4)
+		require.NoError(t, err)
+
+		bridgeZoneAPort := ports[0]
+		bridgeZoneBPort := ports[1]
+		memberZoneAPort := ports[2]
+		memberZoneBPort := ports[3]
+
+		bridgeZoneAAddr := net.JoinHostPort("localhost", strconv.Itoa(bridgeZoneAPort))
+		bridgeZoneBAddr := net.JoinHostPort("localhost", strconv.Itoa(bridgeZoneBPort))
+
+		// Configure DNS for bridges to discover each other
+		mockDNSResolution("dns+bridge-zone-a-join", []string{bridgeZoneAAddr, bridgeZoneBAddr})
+		mockDNSResolution("dns+bridge-zone-a-rejoin", []string{bridgeZoneAAddr, bridgeZoneBAddr})
+		mockDNSResolution("dns+bridge-zone-b-join", []string{bridgeZoneAAddr, bridgeZoneBAddr})
+		mockDNSResolution("dns+bridge-zone-b-rejoin", []string{bridgeZoneAAddr, bridgeZoneBAddr})
+
+		// Start both bridges
+		cfgBridgeA := makeConfig("bridge-zone-a", "zone-a", roleConfigBridge, bridgeZoneAPort)
+		cfgBridgeB := makeConfig("bridge-zone-b", "zone-b", roleConfigBridge, bridgeZoneBPort)
+
+		mkvBridgeA := NewKV(cfgBridgeA, log.With(logger, "node", "bridge-zone-a"), newDNSProviderMock(resolveDNS), nil)
+		mkvBridgeB := NewKV(cfgBridgeB, log.With(logger, "node", "bridge-zone-b"), newDNSProviderMock(resolveDNS), nil)
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeA))
+		t.Cleanup(func() {
+			// Ignore error because it could be already terminated.
+			_ = services.StopAndAwaitTerminated(ctx, mkvBridgeA)
+		})
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeB))
+		t.Cleanup(func() {
+			// Ignore error because it could be already terminated.
+			_ = services.StopAndAwaitTerminated(ctx, mkvBridgeB)
+		})
+
+		// Wait for bridges to discover each other
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeA, 2), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeB, 2), 3*time.Second, 100*time.Millisecond)
+
+		// Start member-zone-a, joining bridge-zone-a
+		mockDNSResolution("dns+member-zone-a-join", []string{bridgeZoneAAddr})
+		mockDNSResolution("dns+member-zone-a-rejoin", []string{bridgeZoneAAddr})
+
+		cfgMemberA := makeConfig("member-zone-a", "zone-a", roleConfigMember, memberZoneAPort)
+		mkvMemberA := NewKV(cfgMemberA, log.With(logger, "node", "member-zone-a"), newDNSProviderMock(resolveDNS), nil)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvMemberA))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvMemberA))
+		})
+
+		clientMemberA, err := NewClient(mkvMemberA, c)
+		require.NoError(t, err)
+
+		// Start member-zone-b, joining bridge-zone-b
+		mockDNSResolution("dns+member-zone-b-join", []string{bridgeZoneBAddr})
+		mockDNSResolution("dns+member-zone-b-rejoin", []string{bridgeZoneBAddr})
+
+		cfgMemberB := makeConfig("member-zone-b", "zone-b", roleConfigMember, memberZoneBPort)
+		mkvMemberB := NewKV(cfgMemberB, log.With(logger, "node", "member-zone-b"), newDNSProviderMock(resolveDNS), nil)
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvMemberB))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvMemberB))
+		})
+
+		clientMemberB, err := NewClient(mkvMemberB, c)
+		require.NoError(t, err)
+
+		// Add state via CAS
+		require.NoError(t, cas(clientMemberA, key, updateFn("member-A")))
+		require.NoError(t, cas(clientMemberB, key, updateFn("member-B")))
+
+		// All 4 nodes should see each other and have the state
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeA, 4), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeB, 4), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberA, 4), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberB, 4), 3*time.Second, 100*time.Millisecond)
+
+		require.EventuallyWithT(t, expectDataMembers(clientMemberA, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberB, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+
+		// Terminate both bridges (simulates all bridges lost)
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeA))
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeB))
+
+		// Restart bridges on the SAME ports with fresh empty state
+		cfgBridgeANew := makeConfig("bridge-zone-a", "zone-a", roleConfigBridge, bridgeZoneAPort)
+		cfgBridgeBNew := makeConfig("bridge-zone-b", "zone-b", roleConfigBridge, bridgeZoneBPort)
+
+		mkvBridgeANew := NewKV(cfgBridgeANew, log.With(logger, "node", "bridge-zone-a-new"), newDNSProviderMock(resolveDNS), nil)
+		mkvBridgeBNew := NewKV(cfgBridgeBNew, log.With(logger, "node", "bridge-zone-b-new"), newDNSProviderMock(resolveDNS), nil)
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeANew))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeANew))
+		})
+
+		require.NoError(t, services.StartAndAwaitRunning(ctx, mkvBridgeBNew))
+		t.Cleanup(func() {
+			require.NoError(t, services.StopAndAwaitTerminated(ctx, mkvBridgeBNew))
+		})
+
+		clientBridgeANew, err := NewClient(mkvBridgeANew, c)
+		require.NoError(t, err)
+		clientBridgeBNew, err := NewClient(mkvBridgeBNew, c)
+		require.NoError(t, err)
+
+		// Wait for automatic recovery via existing members' rejoin
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeANew, 4), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvBridgeBNew, 4), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberA, 4), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectMemberlistMembersCount(mkvMemberB, 4), 3*time.Second, 100*time.Millisecond)
+
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeANew, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientBridgeBNew, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberA, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+		require.EventuallyWithT(t, expectDataMembers(clientMemberB, []string{"member-A", "member-B"}), 3*time.Second, 100*time.Millisecond)
+	})
+}
+
+// newTestKVForLocalStateCache returns a started KV with the delegate marked ready, so that
+// LocalState/MergeRemoteState can be driven directly without a second node.
+func newTestKVForLocalStateCache(tb testing.TB, opts ...func(*KVConfig)) *KV {
+	tb.Helper()
+
+	c := dataCodec{}
+
+	var cfg KVConfig
+	flagext.DefaultValues(&cfg)
+	cfg.TCPTransport = TCPTransportConfig{BindAddrs: getLocalhostAddrs()}
+	cfg.Codecs = []codec.Codec{c}
+	// These tests are about the cache, so default it on; individual cases override as needed.
+	cfg.LocalStateCacheEnabled = true
+	// Config must be finalised before the service starts; mutating it afterwards races
+	// with the running loop.
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	reg := prometheus.NewPedanticRegistry()
+	mkv := NewKV(cfg, log.NewNopLogger(), &staticDNSProviderMock{}, reg)
+	require.NoError(tb, services.StartAndAwaitRunning(tb.Context(), mkv))
+	tb.Cleanup(func() {
+		require.NoError(tb, services.StopAndAwaitTerminated(context.Background(), mkv))
+	})
+	mkv.delegateReady.Store(true)
+
+	return mkv
+}
+
+// parseLocalState decodes the payload produced by LocalState into key -> value members,
+// so tests can assert on what a peer would actually observe.
+func parseLocalState(t *testing.T, payload []byte) map[string][]string {
+	t.Helper()
+
+	out := map[string][]string{}
+	for len(payload) > 0 {
+		require.GreaterOrEqual(t, len(payload), lengthPrefixSize, "truncated length prefix")
+		l := binary.BigEndian.Uint32(payload)
+		payload = payload[lengthPrefixSize:]
+		require.GreaterOrEqual(t, uint32(len(payload)), l, "truncated KV pair")
+
+		pair := KeyValuePair{}
+		require.NoError(t, pair.Unmarshal(payload[:l]))
+		payload = payload[l:]
+
+		decoded, err := dataCodec{}.Decode(pair.Value)
+		require.NoError(t, err)
+		out[pair.Key] = decoded.(*data).getAllMembers()
+	}
+	return out
+}
+
+func localStateCacheCounts(mkv *KV, key string) (hits, misses float64) {
+	return testutil.ToFloat64(mkv.localStateCacheHits.WithLabelValues(key)),
+		testutil.ToFloat64(mkv.localStateCacheMisses.WithLabelValues(key))
+}
+
+func TestLocalStateCacheServesUnchangedEntriesFromCache(t *testing.T) {
+	mkv := newTestKVForLocalStateCache(t)
+
+	client, err := NewClient(mkv, dataCodec{})
+	require.NoError(t, err)
+
+	require.NoError(t, client.CAS(t.Context(), "ring-a", func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"a": {Timestamp: 1, State: JOINING}}}, true, nil
+	}))
+	require.NoError(t, client.CAS(t.Context(), "ring-b", func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"b": {Timestamp: 1, State: JOINING}}}, true, nil
+	}))
+
+	// First pull has to serialize both keys.
+	first := mkv.LocalState(false)
+	for _, k := range []string{"ring-a", "ring-b"} {
+		hits, misses := localStateCacheCounts(mkv, k)
+		require.Equal(t, float64(0), hits, k)
+		require.Equal(t, float64(1), misses, k)
+	}
+
+	// Second pull changes nothing, so both keys must come from the cache and the payload
+	// must be byte-for-byte what the uncached path produced.
+	second := mkv.LocalState(false)
+	for _, k := range []string{"ring-a", "ring-b"} {
+		hits, misses := localStateCacheCounts(mkv, k)
+		require.Equal(t, float64(1), hits, k)
+		require.Equal(t, float64(1), misses, "unchanged entries must not be re-serialized: %s", k)
+	}
+	require.Equal(t, parseLocalState(t, first), parseLocalState(t, second))
+
+	// Only the changed key is re-serialized; the other keeps hitting.
+	require.NoError(t, client.CAS(t.Context(), "ring-a", func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"a": {Timestamp: 2, State: ACTIVE}}}, true, nil
+	}))
+	mkv.LocalState(false)
+	hits, misses := localStateCacheCounts(mkv, "ring-a")
+	require.Equal(t, float64(1), hits)
+	require.Equal(t, float64(2), misses)
+	hits, misses = localStateCacheCounts(mkv, "ring-b")
+	require.Equal(t, float64(2), hits)
+	require.Equal(t, float64(1), misses)
+}
+
+// TestLocalStateCacheInvalidatedOnInPlaceMerge covers the subtle case: mergeValueForKey
+// mutates the stored value in place rather than replacing it, so the cache cannot rely on
+// the value pointer changing. It must key off the version, which is bumped in the same
+// critical section as the mutation.
+func TestLocalStateCacheInvalidatedOnInPlaceMerge(t *testing.T) {
+	mkv := newTestKVForLocalStateCache(t)
+
+	client, err := NewClient(mkv, dataCodec{})
+	require.NoError(t, err)
+
+	require.NoError(t, client.CAS(t.Context(), key, func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"a": {Timestamp: 1, State: ACTIVE}}}, true, nil
+	}))
+
+	// Prime the cache.
+	require.Equal(t, map[string][]string{key: {"a"}}, parseLocalState(t, mkv.LocalState(false)))
+
+	// Merge an update the way an incoming push/pull sync would. This goes through
+	// mergeValueForKey, which mutates the stored value in place.
+	peer := newTestKVForLocalStateCache(t)
+	peerClient, err := NewClient(peer, dataCodec{})
+	require.NoError(t, err)
+	require.NoError(t, peerClient.CAS(t.Context(), key, func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"c": {Timestamp: 5, State: ACTIVE}}}, true, nil
+	}))
+
+	mkv.MergeRemoteState(peer.LocalState(false), false)
+
+	require.Equal(t, map[string][]string{key: {"a", "c"}}, parseLocalState(t, mkv.LocalState(false)),
+		"in-place merge must invalidate the cache")
+}
+
+// TestLocalStateCacheInvalidatedOnTombstoneRemoval covers the one mutation that doesn't bump
+// the version: mergeValueForKey removes expired tombstones from the stored value in place, and
+// returns early when the change consists only of those tombstones.
+func TestLocalStateCacheInvalidatedOnTombstoneRemoval(t *testing.T) {
+	mkv := newTestKVForLocalStateCache(t, func(cfg *KVConfig) {
+		cfg.LeftIngestersTimeout = time.Minute
+	})
+
+	// Seeded directly, because a CAS would remove the expired tombstone on the way in, and
+	// the merge below has to be what removes it.
+	expired := time.Now().Add(-time.Hour).Unix()
+	mkv.storeMu.Lock()
+	mkv.store[key] = ValueDesc{
+		value:      &data{Members: map[string]member{"a": {Timestamp: expired, State: ACTIVE}, "left": {Timestamp: expired, State: LEFT}}},
+		Version:    1,
+		CodecID:    dataCodec{}.CodecID(),
+		UpdateTime: time.Now(),
+	}
+	mkv.storeMu.Unlock()
+
+	// Prime the cache with a payload that still contains the tombstone.
+	require.Equal(t, map[string][]string{key: {"a", "left"}}, parseLocalState(t, mkv.LocalState(false)))
+
+	incoming := &data{Members: map[string]member{"left": {Timestamp: expired + 1, State: LEFT}}}
+	_, version, _, _, err := mkv.mergeValueForKey(key, incoming, false, 0, dataCodec{}.CodecID(), false, time.Time{})
+	require.NoError(t, err)
+	require.Zero(t, version, "precondition: this path must not bump the version")
+
+	require.Equal(t, map[string][]string{key: {"a"}}, parseLocalState(t, mkv.LocalState(false)),
+		"tombstones removed in place must not be served from the cache")
+}
+
+func TestLocalStateCacheEvictedWithObsoleteEntries(t *testing.T) {
+	mkv := newTestKVForLocalStateCache(t)
+
+	client, err := NewClient(mkv, dataCodec{})
+	require.NoError(t, err)
+
+	require.NoError(t, client.CAS(t.Context(), key, func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"a": {Timestamp: 1, State: ACTIVE}}}, true, nil
+	}))
+
+	// Prime the cache.
+	require.Len(t, parseLocalState(t, mkv.LocalState(false)), 1)
+
+	mkv.storeMu.RLock()
+	_, cached := mkv.localStateCache[key]
+	mkv.storeMu.RUnlock()
+	require.True(t, cached, "precondition: key should be cached once it has been sent")
+
+	require.NoError(t, mkv.Delete(key))
+
+	// Age the tombstone past the obsolete entries timeout and run the cleanup directly,
+	// so the test doesn't depend on the timing of the background cleanup loop.
+	mkv.storeMu.Lock()
+	aged := mkv.store[key]
+	aged.UpdateTime = time.Now().Add(-2 * mkv.cfg.ObsoleteEntriesTimeout)
+	mkv.store[key] = aged
+	mkv.storeMu.Unlock()
+
+	mkv.cleanupObsoleteEntries()
+
+	mkv.storeMu.RLock()
+	_, cached = mkv.localStateCache[key]
+	cacheLen := len(mkv.localStateCache)
+	mkv.storeMu.RUnlock()
+
+	require.False(t, cached, "cache entry must be evicted with the store entry")
+	require.Equal(t, 0, cacheLen, "cache must not retain entries for removed keys")
+	require.Empty(t, parseLocalState(t, mkv.LocalState(false)))
+
+	require.Zero(t, testutil.CollectAndCount(mkv.localStateCacheHits), "hit series for removed keys must be deleted")
+	require.Zero(t, testutil.CollectAndCount(mkv.localStateCacheMisses), "miss series for removed keys must be deleted")
+}
+
+// BenchmarkLocalState measures sending the full store, which is what a push/pull sync does,
+// with the cache disabled (the default, and the behaviour before it existed) and enabled.
+func BenchmarkLocalState(b *testing.B) {
+	const (
+		keys              = 30
+		instancesPerKey   = 500
+		tokensPerInstance = 64
+	)
+
+	populated := func(b *testing.B, cacheEnabled bool) *KV {
+		mkv := newTestKVForLocalStateCache(b, func(cfg *KVConfig) {
+			cfg.LocalStateCacheEnabled = cacheEnabled
+		})
+
+		client, err := NewClient(mkv, dataCodec{})
+		require.NoError(b, err)
+
+		for i := 0; i < keys; i++ {
+			require.NoError(b, client.CAS(b.Context(), fmt.Sprintf("ring-%d", i), func(interface{}) (interface{}, bool, error) {
+				members := make(map[string]member, instancesPerKey)
+				for j := 0; j < instancesPerKey; j++ {
+					tokens := make([]uint32, tokensPerInstance)
+					for k := range tokens {
+						tokens[k] = uint32(j*tokensPerInstance + k)
+					}
+					members[fmt.Sprintf("instance-%d", j)] = member{Timestamp: int64(j), State: ACTIVE, Tokens: tokens}
+				}
+				return &data{Members: members}, true, nil
+			}))
+		}
+
+		return mkv
+	}
+
+	for _, enabled := range []bool{false, true} {
+		name := "cache_disabled"
+		if enabled {
+			name = "cache_enabled"
+		}
+
+		b.Run(name, func(b *testing.B) {
+			mkv := populated(b, enabled)
+			// Also primes the cache, when there is one.
+			b.Logf("full state: %d keys, %d bytes", keys, len(mkv.LocalState(false)))
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				mkv.LocalState(false)
+			}
+		})
+	}
+}
+
+// TestLocalStateCacheMessageHistory covers the branch that only runs when the troubleshooting
+// history buffer is enabled: the KeyValuePair is not cached, so it gets rebuilt from the
+// entry's wire form and must still round-trip.
+func TestLocalStateCacheMessageHistory(t *testing.T) {
+	mkv := newTestKVForLocalStateCache(t, func(cfg *KVConfig) {
+		cfg.MessageHistoryBufferBytes = 1024 * 1024
+	})
+
+	client, err := NewClient(mkv, dataCodec{})
+	require.NoError(t, err)
+	require.NoError(t, client.CAS(t.Context(), key, func(interface{}) (interface{}, bool, error) {
+		return &data{Members: map[string]member{"a": {Timestamp: 1, State: ACTIVE}}}, true, nil
+	}))
+
+	// Broadcasting the CAS already recorded a message, so measure the delta rather than the
+	// absolute count.
+	before, _ := mkv.getSentAndReceivedMessages()
+
+	// Two pulls: the first builds the entry, the second serves it from the cache. Both must
+	// record an equivalent message, since the pair is reconstructed either way.
+	payload := mkv.LocalState(false)
+	mkv.LocalState(false)
+
+	sent, _ := mkv.getSentAndReceivedMessages()
+	require.Len(t, sent, len(before)+2)
+
+	for i, msg := range sent[len(before):] {
+		require.Equal(t, key, msg.Pair.Key, "message %d", i)
+		require.Equal(t, dataCodec{}.CodecID(), msg.Pair.Codec, "message %d", i)
+		require.Equal(t, len(payload)-lengthPrefixSize, msg.Size, "message %d", i)
+		require.Equal(t, uint(1), msg.Version, "message %d", i)
+
+		decoded, err := dataCodec{}.Decode(msg.Pair.Value)
+		require.NoError(t, err, "message %d", i)
+		require.Equal(t, []string{"a"}, decoded.(*data).getAllMembers(), "message %d", i)
+	}
 }

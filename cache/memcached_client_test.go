@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,58 +15,100 @@ import (
 	"github.com/grafana/gomemcache/memcache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
-
-	"github.com/grafana/dskit/flagext"
 )
 
-func TestMemcachedClientConfig_Validate(t *testing.T) {
-	tests := map[string]struct {
-		setup       func(config *MemcachedClientConfig)
-		expectedErr error
-	}{
-		"should pass on positive write buffer size": {
-			setup: func(config *MemcachedClientConfig) {
-				config.WriteBufferSizeBytes = 12345
-			},
-			expectedErr: nil,
-		},
-		"should pass on positive read buffer size": {
-			setup: func(config *MemcachedClientConfig) {
-				config.ReadBufferSizeBytes = 12345
-			},
-			expectedErr: nil,
-		},
-		"should return error on negative write buffer size": {
-			setup: func(config *MemcachedClientConfig) {
-				config.WriteBufferSizeBytes = -1
-			},
-			expectedErr: ErrInvalidWriteBufferSizeBytes,
-		},
-		"should return error on negative read buffer size": {
-			setup: func(config *MemcachedClientConfig) {
-				config.ReadBufferSizeBytes = -1
-			},
-			expectedErr: ErrInvalidReadBufferSizeBytes,
-		},
-	}
+func TestMemcachedClient_SetAsync(t *testing.T) {
+	t.Run("with non-zero TTL", func(t *testing.T) {
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		client.SetAsync("foo", []byte("bar"), 10*time.Second)
+		require.NoError(t, client.wait())
 
-	for testName, testData := range tests {
-		t.Run(testName, func(t *testing.T) {
-			cfg := MemcachedClientConfig{}
-			memcachedClientConfigDefaultValues(&cfg)
-			cfg.Addresses = flagext.StringSliceCSV{"localhost:11211"}
+		ctx := context.Background()
+		res := client.GetMulti(ctx, []string{"foo"})
+		require.Equal(t, map[string][]byte{"foo": []byte("bar")}, res)
+	})
 
-			testData.setup(&cfg)
-			require.Equal(t, testData.expectedErr, cfg.Validate())
-		})
-	}
+	t.Run("with truncated zero TTL", func(t *testing.T) {
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		client.SetAsync("foo", []byte("bar"), 100*time.Millisecond)
+		require.NoError(t, client.wait())
+
+		ctx := context.Background()
+		res := client.GetMulti(ctx, []string{"foo"})
+		require.Empty(t, res)
+	})
+
+	t.Run("with zero TTL", func(t *testing.T) {
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		client.SetAsync("foo", []byte("bar"), 0)
+		require.NoError(t, client.wait())
+
+		ctx := context.Background()
+		res := client.GetMulti(ctx, []string{"foo"})
+		require.Equal(t, map[string][]byte{"foo": []byte("bar")}, res)
+	})
+}
+
+func TestMemcachedClient_Set(t *testing.T) {
+	t.Run("with non-zero TTL", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		require.NoError(t, client.Set(ctx, "foo", []byte("bar"), time.Minute))
+
+		res := client.GetMulti(ctx, []string{"foo"})
+		require.Equal(t, map[string][]byte{"foo": []byte("bar")}, res)
+	})
+
+	t.Run("with truncated TTL", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		err = client.Set(ctx, "foo", []byte("bar"), 100*time.Millisecond)
+		require.ErrorIs(t, err, ErrInvalidTTL)
+	})
+
+	t.Run("with zero TTL", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		require.NoError(t, client.Set(ctx, "foo", []byte("bar"), 0))
+
+		res := client.GetMulti(ctx, []string{"foo"})
+		require.Equal(t, map[string][]byte{"foo": []byte("bar")}, res)
+	})
+}
+
+func TestMemcachedClient_Add(t *testing.T) {
+	t.Run("item does not exist", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		require.NoError(t, client.Add(ctx, "foo", []byte("bar"), time.Minute))
+	})
+
+	t.Run("item already exists", func(t *testing.T) {
+		ctx := context.Background()
+		client, mock, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+
+		require.NoError(t, mock.Set(&memcache.Item{
+			Key:        "foo",
+			Value:      []byte("baz"),
+			Expiration: 60,
+		}))
+
+		err = client.Add(ctx, "foo", []byte("bar"), time.Minute)
+		require.ErrorIs(t, err, ErrNotStored)
+	})
 }
 
 func TestMemcachedClient_GetMulti(t *testing.T) {
-	setup := setupDefaultMemcachedClient
-
 	t.Run("no allocator", func(t *testing.T) {
-		client, backend, err := setup()
+		client, backend, err := setupDefaultMemcachedClient()
 		require.NoError(t, err)
 		client.SetAsync("foo", []byte("bar"), 10*time.Second)
 		require.NoError(t, client.wait())
@@ -77,7 +120,7 @@ func TestMemcachedClient_GetMulti(t *testing.T) {
 	})
 
 	t.Run("with allocator", func(t *testing.T) {
-		client, backend, err := setup()
+		client, backend, err := setupDefaultMemcachedClient()
 		require.NoError(t, err)
 		client.SetAsync("foo", []byte("bar"), 10*time.Second)
 		require.NoError(t, client.wait())
@@ -85,6 +128,104 @@ func TestMemcachedClient_GetMulti(t *testing.T) {
 		res := client.GetMulti(context.Background(), []string{"foo"}, WithAllocator(&nopAllocator{}))
 		require.Equal(t, map[string][]byte{"foo": []byte("bar")}, res)
 		require.Equal(t, 1, backend.allocations)
+	})
+
+	t.Run("multiple batches", func(t *testing.T) {
+		client, backend, err := setupDefaultMemcachedClient()
+		client.config.MaxGetMultiBatchSize = 2
+
+		require.NoError(t, err)
+		client.SetMultiAsync(map[string][]byte{
+			"foo1": []byte("bar1"),
+			"foo2": []byte("bar2"),
+			"foo3": []byte("bar3"),
+			"foo4": []byte("bar4"),
+			"foo5": []byte("bar5"),
+		}, 10*time.Second)
+		require.NoError(t, client.wait())
+
+		ctx := context.Background()
+		res := client.GetMulti(ctx, []string{"foo1", "foo2", "foo3", "foo4", "foo5"})
+		require.Equal(t, map[string][]byte{
+			"foo1": []byte("bar1"),
+			"foo2": []byte("bar2"),
+			"foo3": []byte("bar3"),
+			"foo4": []byte("bar4"),
+			"foo5": []byte("bar5"),
+		}, res)
+		require.Equal(t, 0, backend.allocations)
+	})
+}
+
+func TestMemcachedClient_GetMultiWithError(t *testing.T) {
+	t.Run("returns error from backend", func(t *testing.T) {
+		backendErr := fmt.Errorf("connection failed")
+		backend := &erroringMockMemcachedClientBackend{
+			mockMemcachedClientBackend: newMockMemcachedClientBackend(),
+			err:                        backendErr,
+		}
+		client, err := newMemcachedClient(
+			log.NewNopLogger(),
+			backend,
+			&mockServerSelector{
+				servers: []mockServer{
+					{addr: "127.0.0.1:11211"},
+				},
+			},
+			MemcachedClientConfig{
+				Addresses:           []string{"localhost"},
+				MaxAsyncConcurrency: 1,
+				MaxAsyncBufferSize:  10,
+			},
+			prometheus.NewPedanticRegistry(),
+			"test",
+		)
+		require.NoError(t, err)
+
+		ctx := context.Background()
+		res, err := client.GetMultiWithError(ctx, []string{"foo"})
+		require.ErrorIs(t, err, backendErr)
+		require.Empty(t, res)
+	})
+
+	t.Run("returns partial results with error", func(t *testing.T) {
+		backendErr := fmt.Errorf("connection failed")
+		backend := &selectiveErrorMockMemcachedClientBackend{
+			mockMemcachedClientBackend: newMockMemcachedClientBackend(),
+			failOnCalls:                map[int]error{2: backendErr}, // Fail on 2nd batch
+		}
+
+		client, err := newMemcachedClient(
+			log.NewNopLogger(),
+			backend,
+			&mockServerSelector{
+				servers: []mockServer{
+					{addr: "127.0.0.1:11211"},
+				},
+			},
+			MemcachedClientConfig{
+				Addresses:            []string{"localhost"},
+				MaxAsyncConcurrency:  1,
+				MaxAsyncBufferSize:   10,
+				MaxGetMultiBatchSize: 1, // Force each key into its own batch
+			},
+			prometheus.NewPedanticRegistry(),
+			"test",
+		)
+		require.NoError(t, err)
+
+		// Set up 3 keys
+		backend.values["foo"] = &memcache.Item{Key: "foo", Value: []byte("bar")}
+		backend.values["baz"] = &memcache.Item{Key: "baz", Value: []byte("qux")}
+		backend.values["abc"] = &memcache.Item{Key: "abc", Value: []byte("def")}
+
+		ctx := context.Background()
+		res, err := client.GetMultiWithError(ctx, []string{"foo", "baz", "abc"})
+
+		// Should have error from the failed batch
+		require.ErrorIs(t, err, backendErr)
+		// Should have partial results from successful batches (2 out of 3)
+		require.Len(t, res, 2)
 	})
 }
 
@@ -135,25 +276,148 @@ func TestMemcachedClient_Touch(t *testing.T) {
 	require.Equal(t, int32(newExpiration.Seconds()), backend.values[key].Expiration)
 }
 
+func TestMemcachedClient_GetMultiWithCAS(t *testing.T) {
+	t.Run("returns values with their tokens", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		require.NoError(t, client.Set(ctx, "foo", []byte("bar"), time.Minute))
+		require.NoError(t, client.Set(ctx, "baz", []byte("qux"), time.Minute))
+
+		res, err := client.GetMultiWithCAS(ctx, []string{"foo", "baz", "missing"})
+		require.NoError(t, err)
+		require.Len(t, res, 2)
+		require.Equal(t, []byte("bar"), res["foo"].Value)
+		require.Equal(t, []byte("qux"), res["baz"].Value)
+		require.NotZero(t, res["foo"].CasID)
+		require.NotEqual(t, res["foo"].CasID, res["baz"].CasID)
+
+		// Every store assigns a new token.
+		require.NoError(t, client.Set(ctx, "foo", []byte("bar"), time.Minute))
+		again, err := client.GetMultiWithCAS(ctx, []string{"foo"})
+		require.NoError(t, err)
+		require.NotEqual(t, res["foo"].CasID, again["foo"].CasID)
+	})
+
+	t.Run("returns error from backend", func(t *testing.T) {
+		backendErr := fmt.Errorf("connection failed")
+		backend := &erroringMockMemcachedClientBackend{
+			mockMemcachedClientBackend: newMockMemcachedClientBackend(),
+			err:                        backendErr,
+		}
+		client, err := newMemcachedClient(
+			log.NewNopLogger(),
+			backend,
+			&mockServerSelector{
+				servers: []mockServer{
+					{addr: "127.0.0.1:11211"},
+				},
+			},
+			MemcachedClientConfig{
+				Addresses:           []string{"localhost"},
+				MaxAsyncConcurrency: 1,
+				MaxAsyncBufferSize:  10,
+			},
+			prometheus.NewPedanticRegistry(),
+			"test",
+		)
+		require.NoError(t, err)
+
+		res, err := client.GetMultiWithCAS(context.Background(), []string{"foo"})
+		require.ErrorIs(t, err, backendErr)
+		require.Empty(t, res)
+	})
+}
+
 func TestMemcachedClient_CompareAndSwap(t *testing.T) {
-	client, backend, err := setupDefaultMemcachedClient()
-	require.NoError(t, err)
+	// setup stores "foo" and returns the token of that version.
+	setup := func(t *testing.T) (*MemcachedClient, *mockMemcachedClientBackend, uint64) {
+		ctx := context.Background()
+		client, backend, err := setupDefaultMemcachedClient()
+		require.NoError(t, err)
+		require.NoError(t, client.Set(ctx, "foo", []byte("bar"), 10*time.Second))
 
-	key := "foo"
-	initialValue := []byte("bar")
-	expiration := 10 * time.Second
+		res, err := client.GetMultiWithCAS(ctx, []string{"foo"})
+		require.NoError(t, err)
+		return client, backend, res["foo"].CasID
+	}
 
-	client.SetAsync(key, initialValue, expiration)
-	require.NoError(t, client.wait())
+	t.Run("stores while the item is unchanged", func(t *testing.T) {
+		client, backend, casID := setup(t)
 
-	newValue := []byte("baz")
-	newExpiration := 20 * time.Second
-	err = client.CompareAndSwap(context.Background(), key, newValue, newExpiration)
-	require.NoError(t, err)
+		err := client.CompareAndSwap(context.Background(), "foo", []byte("baz"), 20*time.Second, casID)
+		require.NoError(t, err)
+		require.Equal(t, []byte("baz"), backend.values["foo"].Value)
+		require.Equal(t, int32(20), backend.values["foo"].Expiration)
+	})
 
-	storedItem := backend.values[key]
-	require.Equal(t, newValue, storedItem.Value)
-	require.Equal(t, int32(newExpiration.Seconds()), storedItem.Expiration)
+	t.Run("conflicts when the item changed since the read", func(t *testing.T) {
+		ctx := context.Background()
+		client, backend, casID := setup(t)
+		require.NoError(t, client.Set(ctx, "foo", []byte("other"), 10*time.Second))
+
+		err := client.CompareAndSwap(ctx, "foo", []byte("baz"), 20*time.Second, casID)
+		require.ErrorIs(t, err, ErrCASConflict)
+		require.Equal(t, []byte("other"), backend.values["foo"].Value)
+	})
+
+	t.Run("conflicts after its own store", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, casID := setup(t)
+		require.NoError(t, client.CompareAndSwap(ctx, "foo", []byte("baz"), 20*time.Second, casID))
+
+		err := client.CompareAndSwap(ctx, "foo", []byte("qux"), 20*time.Second, casID)
+		require.ErrorIs(t, err, ErrCASConflict)
+	})
+
+	t.Run("misses when the item is gone", func(t *testing.T) {
+		ctx := context.Background()
+		client, _, casID := setup(t)
+		require.NoError(t, client.Delete(ctx, "foo"))
+
+		err := client.CompareAndSwap(ctx, "foo", []byte("baz"), 20*time.Second, casID)
+		require.ErrorIs(t, err, memcache.ErrCacheMiss)
+	})
+
+	t.Run("with truncated TTL", func(t *testing.T) {
+		client, _, casID := setup(t)
+
+		err := client.CompareAndSwap(context.Background(), "foo", []byte("baz"), 100*time.Millisecond, casID)
+		require.ErrorIs(t, err, ErrInvalidTTL)
+	})
+
+	t.Run("rejects an item over the max size instead of skipping it", func(t *testing.T) {
+		ctx := context.Background()
+		backend := newMockMemcachedClientBackend()
+		client, err := newMemcachedClient(
+			log.NewNopLogger(),
+			backend,
+			&mockServerSelector{
+				servers: []mockServer{
+					{addr: "127.0.0.1:11211"},
+				},
+			},
+			MemcachedClientConfig{
+				Addresses:           []string{"localhost"},
+				MaxAsyncConcurrency: 1,
+				MaxAsyncBufferSize:  10,
+				MaxItemSize:         3,
+			},
+			prometheus.NewPedanticRegistry(),
+			"test",
+		)
+		require.NoError(t, err)
+		require.NoError(t, client.Set(ctx, "foo", []byte("bar"), 10*time.Second))
+		res, err := client.GetMultiWithCAS(ctx, []string{"foo"})
+		require.NoError(t, err)
+
+		// Set skips an oversized item and reports success; a conditional store must not.
+		err = client.CompareAndSwap(ctx, "foo", []byte("too big"), 20*time.Second, res["foo"].CasID)
+		require.ErrorIs(t, err, ErrItemTooLarge)
+		require.Equal(t, []byte("bar"), backend.values["foo"].Value)
+		err = client.CompareAndSwap(ctx, "missing", []byte("too big"), 20*time.Second, 42)
+		require.ErrorIs(t, err, ErrItemTooLarge)
+	})
 }
 
 func TestMemcachedClient_FlushAll(t *testing.T) {
@@ -201,6 +465,12 @@ func TestMemcachedClient_Delete(t *testing.T) {
 	// Verify that the key is no longer present after deletion
 	afterDeletionResult := client.GetMulti(context.Background(), []string{key})
 	require.Empty(t, afterDeletionResult)
+}
+
+func TestMemcachedClient_Name(t *testing.T) {
+	client, _, err := setupDefaultMemcachedClient()
+	require.NoError(t, err)
+	require.Equal(t, "test", client.Name())
 }
 
 func BenchmarkMemcachedClient_sortKeysByServer(b *testing.B) {
@@ -252,7 +522,16 @@ func setupDefaultMemcachedClient() (*MemcachedClient, *mockMemcachedClientBacken
 	client, err := newMemcachedClient(
 		log.NewNopLogger(),
 		backend,
-		&mockServerSelector{},
+		&mockServerSelector{
+			servers: []mockServer{
+				{
+					addr: "127.0.0.1:11211",
+				},
+				{
+					addr: "127.0.0.2:11211",
+				},
+			},
+		},
 		MemcachedClientConfig{
 			Addresses:           []string{"localhost"},
 			MaxAsyncConcurrency: 1,
@@ -268,6 +547,7 @@ func setupDefaultMemcachedClient() (*MemcachedClient, *mockMemcachedClientBacken
 type mockMemcachedClientBackend struct {
 	allocations int
 	values      map[string]*memcache.Item
+	casID       uint64 // the last CAS token handed out; every store gets a new one, as in Memcached
 }
 
 func newMockMemcachedClientBackend() *mockMemcachedClientBackend {
@@ -276,7 +556,7 @@ func newMockMemcachedClientBackend() *mockMemcachedClientBackend {
 	}
 }
 
-func (m *mockMemcachedClientBackend) GetMulti(keys []string, opts ...memcache.Option) (map[string]*memcache.Item, error) {
+func (m *mockMemcachedClientBackend) GetMulti(ctx context.Context, keys []string, opts ...memcache.Option) (map[string]*memcache.Item, error) {
 	options := &memcache.Options{}
 	for _, opt := range opts {
 		opt(options)
@@ -296,8 +576,23 @@ func (m *mockMemcachedClientBackend) GetMulti(keys []string, opts ...memcache.Op
 	return out, nil
 }
 
-func (m *mockMemcachedClientBackend) Set(item *memcache.Item) error {
+func (m *mockMemcachedClientBackend) store(item *memcache.Item) {
+	m.casID++
+	item.CasID = m.casID
 	m.values[item.Key] = item
+}
+
+func (m *mockMemcachedClientBackend) Set(item *memcache.Item) error {
+	m.store(item)
+	return nil
+}
+
+func (m *mockMemcachedClientBackend) Add(item *memcache.Item) error {
+	if _, ok := m.values[item.Key]; ok {
+		return memcache.ErrNotStored
+	}
+
+	m.store(item)
 	return nil
 }
 
@@ -326,7 +621,15 @@ func (m *mockMemcachedClientBackend) Increment(key string, delta uint64) (uint64
 }
 
 func (m *mockMemcachedClientBackend) CompareAndSwap(item *memcache.Item) error {
-	m.values[item.Key] = item
+	current, ok := m.values[item.Key]
+	if !ok {
+		return memcache.ErrCacheMiss
+	}
+	if current.CasID != item.CasID {
+		return memcache.ErrCASConflict
+	}
+
+	m.store(item)
 	return nil
 }
 
@@ -336,6 +639,38 @@ func (m *mockMemcachedClientBackend) FlushAll() error {
 }
 
 func (m *mockMemcachedClientBackend) Close() {}
+
+// erroringMockMemcachedClientBackend wraps mockMemcachedClientBackend and returns
+// a configurable error from GetMulti.
+type erroringMockMemcachedClientBackend struct {
+	*mockMemcachedClientBackend
+	err error
+}
+
+func (m *erroringMockMemcachedClientBackend) GetMulti(ctx context.Context, keys []string, opts ...memcache.Option) (map[string]*memcache.Item, error) {
+	result, _ := m.mockMemcachedClientBackend.GetMulti(ctx, keys, opts...)
+	return result, m.err
+}
+
+// selectiveErrorMockMemcachedClientBackend fails GetMulti on specific call numbers.
+type selectiveErrorMockMemcachedClientBackend struct {
+	*mockMemcachedClientBackend
+	failOnCalls map[int]error // map of call number -> error to return
+	callCount   int
+	mu          sync.Mutex
+}
+
+func (m *selectiveErrorMockMemcachedClientBackend) GetMulti(ctx context.Context, keys []string, opts ...memcache.Option) (map[string]*memcache.Item, error) {
+	m.mu.Lock()
+	m.callCount++
+	currentCall := m.callCount
+	m.mu.Unlock()
+
+	if err, shouldFail := m.failOnCalls[currentCall]; shouldFail {
+		return nil, err
+	}
+	return m.mockMemcachedClientBackend.GetMulti(ctx, keys, opts...)
+}
 
 type mockServer struct {
 	addr string

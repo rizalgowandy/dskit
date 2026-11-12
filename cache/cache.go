@@ -13,12 +13,29 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+const (
+	BackendMemcached = "memcached"
+)
+
+var (
+	ErrNotStored    = errors.New("item not stored")
+	ErrInvalidTTL   = errors.New("invalid TTL")
+	ErrCASConflict  = errors.New("compare-and-swap conflict")
+	ErrItemTooLarge = errors.New("item too large")
+)
+
 // Cache is a high level interface to interact with a cache.
 type Cache interface {
 	// GetMulti fetches multiple keys at once from a cache. In case of error,
 	// an empty map is returned and the error tracked/logged. One or more Option
 	// instances may be passed to modify the behavior of this GetMulti call.
 	GetMulti(ctx context.Context, keys []string, opts ...Option) map[string][]byte
+
+	// GetMultiWithError fetches multiple keys at once from a cache and returns an error
+	// if the operation failed. It may return both results and an error if there are only partial
+	// failures. One or more Option instances may be passed to modify the
+	// behavior of this GetMultiWithError call.
+	GetMultiWithError(ctx context.Context, keys []string, opts ...Option) (map[string][]byte, error)
 
 	// SetAsync enqueues an operation to store a key into a cache. In case the underlying
 	// operation fails, the error will be tracked/logged.
@@ -28,9 +45,15 @@ type Cache interface {
 	// any underlying async operations fail, the errors will be tracked/logged.
 	SetMultiAsync(data map[string][]byte, ttl time.Duration)
 
-	// Delete deletes a key from a cache. This is a synchronous operation. If an asynchronous
-	// set operation for key is still pending to be processed, it will wait for it to complete
-	// before performing deletion.
+	// Set stores a key and value into a cache.
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+
+	// Add stores a key and value into a cache only if it does not already exist. If the
+	// item was not stored because an entry already exists in the cache, ErrNotStored will
+	// be returned.
+	Add(ctx context.Context, key string, value []byte, ttl time.Duration) error
+
+	// Delete deletes a key from a cache.
 	Delete(ctx context.Context, key string) error
 
 	// Stop client and release underlying resources.
@@ -72,28 +95,20 @@ type Allocator interface {
 	Put(b *[]byte)
 }
 
-const (
-	BackendMemcached = "memcached"
-	BackendRedis     = "redis"
-)
-
 type BackendConfig struct {
 	Backend   string                `yaml:"backend"`
 	Memcached MemcachedClientConfig `yaml:"memcached"`
-	Redis     RedisClientConfig     `yaml:"redis"`
 }
 
 // Validate the config.
 func (cfg *BackendConfig) Validate() error {
-	if cfg.Backend != "" && cfg.Backend != BackendMemcached && cfg.Backend != BackendRedis {
+	if cfg.Backend != "" && cfg.Backend != BackendMemcached {
 		return fmt.Errorf("unsupported cache backend: %s", cfg.Backend)
 	}
 
 	switch cfg.Backend {
 	case BackendMemcached:
 		return cfg.Memcached.Validate()
-	case BackendRedis:
-		return cfg.Redis.Validate()
 	}
 	return nil
 }
@@ -105,8 +120,6 @@ func CreateClient(cacheName string, cfg BackendConfig, logger log.Logger, reg pr
 		return nil, nil
 	case BackendMemcached:
 		return NewMemcachedClientWithConfig(logger, cacheName, cfg.Memcached, reg)
-	case BackendRedis:
-		return NewRedisClient(logger, cacheName, cfg.Redis, reg)
 	default:
 		return nil, errors.Errorf("unsupported cache type for cache %s: %s", cacheName, cfg.Backend)
 	}

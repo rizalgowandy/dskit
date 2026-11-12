@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +17,6 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/grafana/dskit/cancellation"
-	"github.com/grafana/dskit/internal/slices"
 	"github.com/grafana/dskit/spanlogger"
 )
 
@@ -108,7 +108,7 @@ func failingFunctionAfter(failAfter int32, delay time.Duration) func(context.Con
 }
 
 func failingFunctionOnZones(zones ...string) func(context.Context, *InstanceDesc) (interface{}, error) {
-	return func(ctx context.Context, ing *InstanceDesc) (interface{}, error) {
+	return func(_ context.Context, ing *InstanceDesc) (interface{}, error) {
 		for _, zone := range zones {
 			if ing.Zone == zone {
 				return nil, errZoneFailure
@@ -135,7 +135,7 @@ func TestReplicationSet_Do(t *testing.T) {
 			instances: []InstanceDesc{
 				{},
 			},
-			f: func(c context.Context, id *InstanceDesc) (interface{}, error) {
+			f: func(context.Context, *InstanceDesc) (interface{}, error) {
 				return 1, nil
 			},
 			want: []interface{}{1},
@@ -143,7 +143,7 @@ func TestReplicationSet_Do(t *testing.T) {
 		{
 			name:      "max errors = 0, should fail on 1 error out of 1 instance",
 			instances: []InstanceDesc{{}},
-			f: func(c context.Context, id *InstanceDesc) (interface{}, error) {
+			f: func(context.Context, *InstanceDesc) (interface{}, error) {
 				return nil, errFailure
 			},
 			want:          nil,
@@ -169,7 +169,7 @@ func TestReplicationSet_Do(t *testing.T) {
 			name:      "max errors = 1, should handle context canceled",
 			instances: []InstanceDesc{{}, {}, {}},
 			maxErrors: 1,
-			f: func(c context.Context, id *InstanceDesc) (interface{}, error) {
+			f: func(context.Context, *InstanceDesc) (interface{}, error) {
 				time.Sleep(300 * time.Millisecond)
 				return 1, nil
 			},
@@ -180,7 +180,7 @@ func TestReplicationSet_Do(t *testing.T) {
 		{
 			name:      "max errors = 0, should succeed on all successful instances",
 			instances: []InstanceDesc{{Zone: "zone1"}, {Zone: "zone2"}, {Zone: "zone3"}},
-			f: func(c context.Context, id *InstanceDesc) (interface{}, error) {
+			f: func(context.Context, *InstanceDesc) (interface{}, error) {
 				return 1, nil
 			},
 			want: []interface{}{1, 1, 1},
@@ -252,15 +252,15 @@ func TestReplicationSet_Do(t *testing.T) {
 }
 
 func TestDoUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
-	successfulF := func(ctx context.Context, desc *InstanceDesc) (string, error) {
+	successfulF := func(_ context.Context, desc *InstanceDesc) (string, error) {
 		return desc.Addr, nil
 	}
 
-	failingF := func(ctx context.Context, desc *InstanceDesc) (string, error) {
+	failingF := func(_ context.Context, desc *InstanceDesc) (string, error) {
 		return "", fmt.Errorf("this is the error for %v", desc.Addr)
 	}
 
-	failingZoneB := func(ctx context.Context, desc *InstanceDesc) (string, error) {
+	failingZoneB := func(_ context.Context, desc *InstanceDesc) (string, error) {
 		if desc.Zone == "zone-b" {
 			return "", fmt.Errorf("this is the error for %v", desc.Addr)
 		}
@@ -390,11 +390,12 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 	}
 
 	for name, testCase := range testCases {
-		testCase := testCase
 		t.Run(name, func(t *testing.T) {
 			for _, minimizeRequests := range []bool{true, false} {
 				t.Run(fmt.Sprintf("minimize requests: %v", minimizeRequests), func(t *testing.T) {
 					defer goleak.VerifyNone(t)
+					const partitionID = int32(123)
+					testCase.replicationSet.PartitionID = partitionID
 
 					logger := &testLogger{}
 					spanLogger, ctx := spanlogger.New(context.Background(), logger, "DoUntilQuorum test", dummyTenantResolver{})
@@ -437,14 +438,16 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 					cleanupTracker.assertCorrectCleanup(testCase.expectedResults, expectedCleanup)
 
 					if testCase.expectedError == nil {
-						require.Contains(t, logger.messages, map[interface{}]interface{}{
-							"level": level.DebugValue(),
-							"msg":   "quorum reached",
+						require.Contains(t, logger.messages, map[any]any{
+							"level":        level.DebugValue(),
+							"msg":          "quorum reached",
+							"partition_id": partitionID,
 						})
 					} else {
-						require.Contains(t, logger.messages, map[interface{}]interface{}{
-							"level": level.ErrorValue(),
-							"msg":   "cancelling all outstanding requests because quorum cannot be reached",
+						require.Contains(t, logger.messages, map[any]any{
+							"level":        level.ErrorValue(),
+							"msg":          "cancelling all outstanding requests because quorum cannot be reached",
+							"partition_id": partitionID,
 						})
 					}
 				})
@@ -464,6 +467,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_MultipleUnavailableZo
 			{Addr: "zone-c-replica-2", Zone: "zone-c"},
 		},
 		MaxUnavailableZones: 1,
+		PartitionID:         123,
 	}
 
 	for _, minimizeRequests := range []bool{true, false} {
@@ -504,9 +508,10 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_MultipleUnavailableZo
 			cleanupTracker.collectCleanedUpInstancesWithExpectedCount(len(expectedCleanup))
 			cleanupTracker.assertCorrectCleanup([]string{}, expectedCleanup)
 
-			require.Contains(t, logger.messages, map[interface{}]interface{}{
-				"level": level.ErrorValue(),
-				"msg":   "cancelling all outstanding requests because quorum cannot be reached",
+			require.Contains(t, logger.messages, map[any]any{
+				"level":        level.ErrorValue(),
+				"msg":          "cancelling all outstanding requests because quorum cannot be reached",
+				"partition_id": replicationSet.PartitionID,
 			})
 		})
 	}
@@ -664,7 +669,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ZoneSorting(t *testin
 
 	cfg := DoUntilQuorumConfig{
 		MinimizeRequests: true,
-		ZoneSorter: func(zones []string) []string {
+		ZoneSorter: func([]string) []string {
 			return []string{"zone-b", "zone-d", "zone-a", "zone-c"}
 		},
 	}
@@ -700,6 +705,14 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_CancelsEntireZoneImme
 	waitForFailingZoneToSeeCancelledContext := make(chan struct{})
 	mtx := sync.RWMutex{}
 
+	// Both replicas in the failing zone must enter f() before replica-1 returns its error.
+	// Without this, there is a race: replica-1's error can be processed by the main loop
+	// (cancelling the zone's contexts) before replica-2's goroutine reaches awaitStart.
+	// When that happens, awaitStart's select may pick ctx.Done() over the release channel,
+	// so replica-2 never enters f() and never closes waitForFailingZoneToSeeCancelledContext.
+	failingZoneReplicasEnteredF := sync.WaitGroup{}
+	failingZoneReplicasEnteredF.Add(2)
+
 	f := func(ctx context.Context, instance *InstanceDesc, cancel context.CancelCauseFunc) (string, error) {
 		cleanupTracker.trackCall(ctx, instance, cancel)
 
@@ -714,26 +727,36 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_CancelsEntireZoneImme
 		// If this instance is in the failing zone:
 		// - if it's replica-1, return an error to trigger the cancellation of the zone
 		// - if it's replica-2, wait for this instance's context to be cancelled before returning
-		if instance.Addr == failingZone+"-replica-1" {
-			if strings.HasSuffix(instance.Addr, "-replica-1") {
-				return "", errors.New("this is the failing instance")
-			}
-		} else if instance.Addr == failingZone+"-replica-2" {
+		switch instance.Addr {
+		case failingZone + "-replica-1":
+			// Wait for both replicas in the failing zone to enter f() before returning the
+			// error, so that replica-2 is guaranteed to be past awaitStart and able to
+			// observe the context cancellation inside f().
+			failingZoneReplicasEnteredF.Done()
+			failingZoneReplicasEnteredF.Wait()
+			return "", errors.New("this is the failing instance")
+		case failingZone + "-replica-2":
+			failingZoneReplicasEnteredF.Done()
+			failingZoneReplicasEnteredF.Wait()
 			select {
 			case <-ctx.Done():
 				close(waitForFailingZoneToSeeCancelledContext)
 				failingZoneSawCancelledContext = true
 			case <-time.After(time.Second):
 				close(waitForFailingZoneToSeeCancelledContext)
-				require.FailNow(t, "other instance in failing zone gave up waiting for its context to be cancelled")
+				// Don't use require.FailNow here: this runs in a goroutine spawned by
+				// DoUntilQuorumWithoutSuccessfulContextCancellation, not the test goroutine.
+				return "", errors.New("other instance in failing zone gave up waiting for its context to be cancelled")
 			}
-		} else {
+		default:
 			// If this instance is not in the failing zone, wait until the failing zone's context is cancelled before returning to avoid races.
 			select {
 			case <-waitForFailingZoneToSeeCancelledContext:
 				// Nothing more to do.
 			case <-time.After(2 * time.Second):
-				require.FailNow(t, "gave up waiting for instance in failing zone to report its context had been cancelled: "+instance.Addr)
+				// Don't use require.FailNow here: this runs in a goroutine spawned by
+				// DoUntilQuorumWithoutSuccessfulContextCancellation, not the test goroutine.
+				return "", fmt.Errorf("gave up waiting for instance in failing zone to report its context had been cancelled: %s", instance.Addr)
 			}
 		}
 
@@ -770,7 +793,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_RunsCallsInParallel(t
 			wg := sync.WaitGroup{}
 			wg.Add(len(replicationSet.Instances))
 
-			f := func(ctx context.Context, desc *InstanceDesc, _ context.CancelCauseFunc) (string, error) {
+			f := func(_ context.Context, desc *InstanceDesc, _ context.CancelCauseFunc) (string, error) {
 				wg.Done()
 
 				// Wait for the other calls to f to start. If this test hangs here, then the calls are not running in parallel.
@@ -1047,6 +1070,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ParentContextHandling
 			{Addr: "instance-2"},
 			{Addr: "instance-3"},
 		},
+		PartitionID: 123,
 	}
 
 	cleanupTracker := newCleanupTracker(t, 3)
@@ -1085,16 +1109,19 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ParentContextHandling
 	cleanupTracker.collectCleanedUpInstances()
 	cleanupTracker.assertCorrectCleanup(nil, []string{"instance-1", "instance-2", "instance-3"})
 
-	expectedLogMessage := map[interface{}]interface{}{
-		"level": level.DebugValue(),
-		"msg":   "parent context done, returning",
-		"err":   context.Canceled,
+	expectedLogMessage := map[any]any{
+		"level":        level.DebugValue(),
+		"msg":          "parent context done, returning",
+		"err":          context.Canceled,
+		"partition_id": int32(123),
 	}
 
 	require.Contains(t, logger.messages, expectedLogMessage)
 }
 
 func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ParentContextHandling_WithMinimizeRequests(t *testing.T) {
+	const partitionID = int32(123)
+
 	testCases := map[string]ReplicationSet{
 		"with zone awareness": {
 			Instances: []InstanceDesc{
@@ -1103,6 +1130,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ParentContextHandling
 				{Addr: "instance-3", Zone: "zone-c"},
 			},
 			MaxUnavailableZones: 1,
+			PartitionID:         partitionID,
 		},
 		"without zone awareness": {
 			Instances: []InstanceDesc{
@@ -1110,7 +1138,8 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ParentContextHandling
 				{Addr: "instance-2"},
 				{Addr: "instance-3"},
 			},
-			MaxErrors: 1,
+			MaxErrors:   1,
+			PartitionID: partitionID,
 		},
 	}
 
@@ -1163,10 +1192,11 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_ParentContextHandling
 			cleanupTracker.collectCleanedUpInstances()
 			cleanupTracker.assertCorrectCleanup(nil, calledInstances)
 
-			expectedLogMessage := map[interface{}]interface{}{
-				"level": level.DebugValue(),
-				"msg":   "parent context done, returning",
-				"err":   context.Canceled,
+			expectedLogMessage := map[any]any{
+				"level":        level.DebugValue(),
+				"msg":          "parent context done, returning",
+				"err":          context.Canceled,
+				"partition_id": partitionID,
 			}
 
 			require.Equal(t, expectedLogMessage, logger.messages[len(logger.messages)-1])
@@ -1255,7 +1285,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_InvalidHedgingConfig(
 		HedgingDelay:     -1 * time.Second,
 	}
 
-	f := func(ctx context.Context, desc *InstanceDesc, cancelFunc context.CancelCauseFunc) (string, error) {
+	f := func(context.Context, *InstanceDesc, context.CancelCauseFunc) (string, error) {
 		require.FailNow(t, "should never call f")
 		return "", nil
 	}
@@ -1442,7 +1472,7 @@ func TestDoUntilQuorumWithoutSuccessfulContextCancellation_LoggingWithNoFailingI
 
 			logger := &testLogger{}
 			spanLogger, ctx := spanlogger.New(context.Background(), logger, "DoUntilQuorum test", dummyTenantResolver{})
-			f := func(ctx context.Context, desc *InstanceDesc, _ context.CancelCauseFunc) (string, error) {
+			f := func(_ context.Context, desc *InstanceDesc, _ context.CancelCauseFunc) (string, error) {
 				return desc.Addr, nil
 			}
 
@@ -1714,7 +1744,7 @@ func TestDoMultiUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 						assert.ErrorIs(t, ctx.Err(), context.Canceled)
 
 						// Depending on timing we may either get the actual error or quorum not reached.
-						assert.Contains(t, []string{errMock.Error(), "context canceled: quorum cannot be reached"}, context.Cause(ctx).Error())
+						assert.Contains(t, []string{fmt.Sprintf("request canceled because quorum was not reached in another replication set due to error: %s", errMock.Error()), "context canceled: quorum cannot be reached"}, context.Cause(ctx).Error())
 						return "", ctx.Err()
 					case <-time.After(time.Second):
 						t.Error("expected the context to get canceled but it wasn't")
@@ -1727,7 +1757,7 @@ func TestDoMultiUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 				assert.Nil(t, results)
 
 				assert.ErrorIs(t, workersCtx.Err(), context.Canceled)
-				assert.EqualError(t, context.Cause(workersCtx), errMock.Error())
+				assert.ErrorContains(t, context.Cause(workersCtx), errMock.Error())
 
 				// Ensure all callback functions terminated.
 				callbacksEnded.Wait()
@@ -1755,7 +1785,7 @@ func TestDoMultiUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 				select {
 				case <-ctx.Done():
 					assert.ErrorIs(t, ctx.Err(), context.Canceled)
-					assert.EqualError(t, context.Cause(ctx), expectedErr)
+					assert.ErrorContains(t, context.Cause(ctx), expectedErr)
 					return "", ctx.Err()
 				case <-time.After(time.Second):
 					t.Error("expected the context to get canceled but it wasn't")
@@ -1771,7 +1801,7 @@ func TestDoMultiUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 		assert.Nil(t, results)
 
 		assert.ErrorIs(t, workersCtx.Err(), context.Canceled)
-		assert.EqualError(t, context.Cause(workersCtx), expectedErr)
+		assert.ErrorContains(t, context.Cause(workersCtx), expectedErr)
 	})
 
 	t.Run("should interrupt execution if caller context is canceled", func(t *testing.T) {
@@ -1782,7 +1812,7 @@ func TestDoMultiUntilQuorumWithoutSuccessfulContextCancellation(t *testing.T) {
 		callbacksStarted.Add(3)
 		callbacksEnded.Add(3)
 
-		f := func(ctx context.Context, instance *InstanceDesc, cancelCtx context.CancelCauseFunc) (string, error) {
+		f := func(ctx context.Context, _ *InstanceDesc, _ context.CancelCauseFunc) (string, error) {
 			callbacksStarted.Done()
 			defer callbacksEnded.Done()
 
@@ -1844,7 +1874,7 @@ func (c *cleanupTracker) trackCall(ctx context.Context, instance *InstanceDesc, 
 func (c *cleanupTracker) calledInstances() []string {
 	instances := []string{}
 
-	c.instanceContexts.Range(func(key, value any) bool {
+	c.instanceContexts.Range(func(key, _ any) bool {
 		instances = append(instances, key.(string))
 
 		return true
@@ -2070,6 +2100,21 @@ func TestReplicationSet_ZoneCount(t *testing.T) {
 	}
 }
 
+func TestContextWithAvailableReplicas(t *testing.T) {
+	t.Run("when available replicas exists in a context", func(t *testing.T) {
+		ctx := ContextWithAvailableReplicas(context.Background(), 5)
+		replicas, ok := GetAvailableReplicas(ctx)
+		require.Equal(t, 5, replicas)
+		require.True(t, ok)
+	})
+
+	t.Run("when available replicas does not exist in a context", func(t *testing.T) {
+		replicas, ok := GetAvailableReplicas(context.Background())
+		require.Equal(t, 0, replicas)
+		require.False(t, ok)
+	})
+}
+
 func BenchmarkReplicationSetZoneCount(b *testing.B) {
 	for _, instancesPerZone := range []int{1, 2, 5, 10, 100, 300} {
 		for _, zones := range []int{1, 2, 3} {
@@ -2124,7 +2169,7 @@ func (l *testLogger) Log(keyvals ...interface{}) error {
 		key := keyvals[i]
 		value := keyvals[i+1]
 
-		if key == "user" || key == "method" {
+		if key == "user" || key == "method" || key == "caller" {
 			// These keys are added automatically by spanlogger, but they're not interesting for our tests.
 			continue
 		}
